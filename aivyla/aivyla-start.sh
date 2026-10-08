@@ -142,7 +142,9 @@ PYSAGEDIAG
     echo "Aivyla: WARNING: no verified Sage wheel on the volume; starting with PyTorch attention" >&2
   fi
 
-  # Only the custom nodes the app workflows use
+  # Custom nodes: default list below, or one folder name per line in $VOL/aivyla/nodes.txt
+  # (lines starting with # are ignored). Adding a node = put its folder in
+  # $VOL/ComfyUI/custom_nodes/ and add its name to nodes.txt. No image rebuild needed.
   nodes=(
     ComfyUI-AIvylaProduction
     aivyla_h3_first_frame_lock
@@ -155,15 +157,23 @@ PYSAGEDIAG
     ComfyUI-PlagueKind-Nodes
     ComfyUI-LTXVideo
   )
+  NODES_FILE="$VOL/aivyla/nodes.txt"
+  if [[ -s "$NODES_FILE" ]]; then
+    mapfile -t nodes < <(tr -d '\r' < "$NODES_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -vE '^(#|$)')
+    echo "Aivyla: node list from $NODES_FILE (${#nodes[@]} nodes)"
+  fi
   for node in "${nodes[@]}"; do
-    test -f "$VOL/ComfyUI/custom_nodes/$node/__init__.py"
+    [[ "$node" =~ ^[A-Za-z0-9._-]+$ && "$node" != "." && "$node" != ".." ]] || { echo "Aivyla: bad node name '$node' in node list" >&2; exit 1; }
+    test -f "$VOL/ComfyUI/custom_nodes/$node/__init__.py" || { echo "Aivyla: node '$node' not found on the volume (custom_nodes/$node/__init__.py)" >&2; exit 1; }
   done
-  test -f "$VOL/ComfyUI/custom_nodes/aivyla_h3_identity_refs/models/face_detection_yunet_2023mar.onnx"
   for node in "${nodes[@]}"; do
+    if [[ "$node" == aivyla_h3_identity_refs ]]; then
+      test -f "$VOL/ComfyUI/custom_nodes/$node/models/face_detection_yunet_2023mar.onnx"
+    fi
     target_dir="/comfyui/custom_nodes/$node"
     rm -rf -- "$target_dir"
     ln -s -- "$VOL/ComfyUI/custom_nodes/$node" "$target_dir"
-    # Normally a no-op: the image already has these packages
+    # No-op when the image already has the packages; a brand-new node's packages are installed here
     if [[ -f "$target_dir/requirements.txt" ]]; then
       python -m pip install --no-cache-dir -q -r "$target_dir/requirements.txt"
     fi
