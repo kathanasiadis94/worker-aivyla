@@ -79,15 +79,10 @@ RUN if [ "$ENABLE_PYTORCH_UPGRADE" = "true" ]; then \
 # RUN downgrades within one layer, so the unwanted versions aren't left behind
 # bloating the image.
 #
-# torch is installed FIRST, pinned to +cu128 builds: ComfyUI's requirements.txt
-# declares a bare `torch`, and default PyPI serves CUDA 13 builds (torch's PyPI
-# wheels depend on nvidia-*-cu13 since 2.11) that require driver >= 580. Hosts
-# allowed in .runpod/hub.json advertise CUDA 12.8/12.9 (driver 570/575), where
-# a cu13 torch fails CUDA init at startup. cu128 builds run on driver >= 570,
-# i.e. every allowed host. Installing torch first satisfies the bare `torch`
-# requirement so the PyPI pass doesn't touch it.
-RUN uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
-      --index-url https://download.pytorch.org/whl/cu128 \
+# torch is installed FIRST as the CUDA 13 (+cu130) build used in production.
+# It needs host driver >= 580, so the endpoint must allow CUDA 13.0 or newer only.
+RUN uv pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 torchaudio==2.11.0+cu130 \
+      --index-url https://download.pytorch.org/whl/cu130 \
     && uv pip install -r /comfyui/requirements.txt \
     && for r in /comfyui/custom_nodes/*/requirements.txt; do \
          [ -f "$r" ] && uv pip install -r "$r" || true; \
@@ -130,57 +125,63 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 # Set the default command to run when starting the container
 CMD ["/start.sh"]
 
-# Stage 2: Download models
-FROM base AS downloader
+# Stage 2: Aivyla production image, without the FLUX demo model of the upstream image.
+FROM base AS aivyla
 
-ARG HUGGINGFACE_ACCESS_TOKEN
-# Set default model type if none is provided
-ARG MODEL_TYPE=flux1-dev-fp8
+ARG AIVYLA_COMFY_COMMIT=a8686f2b33fc540f137df50c0f0719953830a5e7
 
-# Change working directory to ComfyUI
-WORKDIR /comfyui
+COPY aivyla/constraints.txt /etc/aivyla-constraints.txt
+ENV PIP_CONSTRAINT=/etc/aivyla-constraints.txt
 
-# Create necessary directories upfront
-RUN mkdir -p models/checkpoints models/vae models/unet models/clip models/text_encoders models/diffusion_models models/model_patches
+RUN python -m pip uninstall -y albumentationsx albumentations \
+ && python -m pip install --no-cache-dir 'albumentations==2.0.8' 'albucore==0.0.24'
 
-# Download checkpoints/vae/unet/clip models to include in image based on model type
-RUN if [ "$MODEL_TYPE" = "sdxl" ]; then \
-      wget -q -O models/checkpoints/sd_xl_base_1.0.safetensors https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors && \
-      wget -q -O models/vae/sdxl_vae.safetensors https://huggingface.co/stabilityai/sdxl-vae/resolve/main/sdxl_vae.safetensors && \
-      wget -q -O models/vae/sdxl-vae-fp16-fix.safetensors https://huggingface.co/madebyollin/sdxl-vae-fp16-fix/resolve/main/sdxl_vae.safetensors; \
-    fi
+# Pinned ComfyUI core (same commit the network volume uses) and its requirements
+RUN git clone -q --filter=blob:none https://github.com/comfyanonymous/ComfyUI /tmp/comfy-src \
+ && git -C /tmp/comfy-src checkout -q "${AIVYLA_COMFY_COMMIT}" \
+ && git -C /tmp/comfy-src archive --format=tar HEAD | tar -xf - -C /comfyui \
+ && echo "${AIVYLA_COMFY_COMMIT}" > /comfyui/.aivyla-core-commit \
+ && rm -rf /tmp/comfy-src \
+ && python -m pip install --no-cache-dir -r /comfyui/requirements.txt \
+ && python -m pip install --no-cache-dir --no-deps \
+      comfy-aimdo==0.5.5 comfy-kitchen==0.2.35 comfyui-embedded-docs==0.5.11 \
+      comfyui-frontend-package==1.52.7 comfyui-workflow-templates==0.11.62 \
+      comfyui-workflow-templates-core==0.3.350 comfyui-workflow-templates-json==0.1.85 \
+      comfyui-workflow-templates-media-assets-01==0.1.46
 
-RUN if [ "$MODEL_TYPE" = "sd3" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/checkpoints/sd3_medium_incl_clips_t5xxlfp8.safetensors https://huggingface.co/stabilityai/stable-diffusion-3-medium/resolve/main/sd3_medium_incl_clips_t5xxlfp8.safetensors; \
-    fi
+# Compiler and Python headers, needed to build insightface
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential python3.12-dev \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN if [ "$MODEL_TYPE" = "flux1-schnell" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/unet/flux1-schnell.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors && \
-      wget -q -O models/clip/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors && \
-      wget -q -O models/clip/t5xxl_fp8_e4m3fn.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/vae/ae.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors; \
-    fi
+# Custom-node packages: exactly the versions production installed, in the same order
+RUN python -m pip install --no-cache-dir 'ninja==1.13.0' 'wheel==0.45.1' \
+ && python -m pip install --no-cache-dir --no-deps \
+      cloudpickle==3.1.2 contourpy==1.4.0 cycler==0.12.1 cython==3.3.0 decorator==5.3.1 \
+      easydict==1.13 flatbuffers==25.12.19 fonttools==4.66.1 imageio==2.38.1 joblib==1.6.0 \
+      kiwisolver==1.5.1 lazy_loader==0.6 librosa==1.0.0 llvmlite==0.50.0 matplotlib==3.11.2 \
+      ml_dtypes==0.6.0 msgpack==1.2.3 narwhals==2.26.0 numba==0.68.0 onnx==1.23.2 \
+      onnxruntime==1.30.0 opencv-python==5.0.0.93 platformdirs==4.12.4 pooch==1.9.0 \
+      protobuf==7.36.2 pyparsing==3.3.3 scikit-image==0.26.0 scikit-learn==1.9.1 \
+      soundfile==0.14.0 soxr==1.1.0 threadpoolctl==3.7.0 tifffile==2026.9.20 \
+ && python -m pip install --no-cache-dir --no-deps insightface==0.7.3 \
+ && python -m pip install --no-cache-dir --no-deps opencv-python-headless==4.14.0.94 \
+ && python -m pip install --no-cache-dir --no-deps \
+      color-matcher==0.6.0 ddt==1.7.2 docutils==0.23 mss==10.2.0 \
+ && python -m pip install --no-cache-dir --no-deps \
+      diffusers==0.41.0 huggingface_hub==1.33.0 importlib_metadata==9.0.1 ninja==1.11.1.4 \
+      timm==1.0.30 tokenizers==0.23.2 transformers==5.19.0 zipp==4.1.1 \
+ && python -m pip install --no-cache-dir --no-deps \
+      opencv-contrib-python==5.0.0.93 onnxruntime-gpu==1.30.0
 
-RUN if [ "$MODEL_TYPE" = "flux1-dev" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/unet/flux1-dev.safetensors https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors && \
-      wget -q -O models/clip/clip_l.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors && \
-      wget -q -O models/clip/t5xxl_fp8_e4m3fn.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/vae/ae.safetensors https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors; \
-    fi
+ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}
 
-RUN if [ "$MODEL_TYPE" = "flux1-dev-fp8" ]; then \
-      wget -q -O models/checkpoints/flux1-dev-fp8.safetensors https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux1-dev-fp8.safetensors; \
-    fi
+RUN test -f /opt/venv/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13 \
+ && python -c "from importlib.metadata import version as v; assert v('torch') == '2.11.0+cu130', v('torch'); print('torch', v('torch'))" \
+ && python -c "import cv2, onnxruntime, insightface, albumentations; print('cv2', cv2.__version__, 'ort', onnxruntime.__version__)" \
+ && cd /comfyui && timeout 300 python main.py --quick-test-for-ci --cpu
 
-RUN if [ "$MODEL_TYPE" = "z-image-turbo" ]; then \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/text_encoders/qwen_3_4b.safetensors https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/diffusion_models/z_image_turbo_bf16.safetensors https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/vae/ae.safetensors https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors && \
-      wget -q --header="Authorization: Bearer ${HUGGINGFACE_ACCESS_TOKEN}" -O models/model_patches/Z-Image-Turbo-Fun-Controlnet-Union.safetensors https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union/resolve/main/Z-Image-Turbo-Fun-Controlnet-Union.safetensors; \
-    fi
+COPY aivyla/aivyla-start.sh /aivyla-start.sh
+RUN chmod +x /aivyla-start.sh
 
-# Stage 3: Final image
-FROM base AS final
-
-# Copy models from stage 2 to the final image
-COPY --from=downloader /comfyui/models /comfyui/models
+CMD ["/aivyla-start.sh"]

@@ -1,0 +1,6 @@
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+torchaudio==2.11.0+cu130
+albumentations==2.0.8
+albucore==0.0.24
+sageattention==2.2.0
