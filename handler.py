@@ -830,6 +830,14 @@ def handler(job):
     if error_message:
         return {"error": error_message}
 
+    studio_output_requested = (isinstance(job_input, dict) and
+                               job_input.get("output_transport") == "studio")
+    if studio_output_requested:
+        try:
+            from aivyla_output_upload import check_transport_ready
+            check_transport_ready()
+        except Exception as exc:
+            return {"error": f"Studio output transport preflight failed: {type(exc).__name__}: {exc}"}
     # Extract validated data
     workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
@@ -868,6 +876,7 @@ def handler(job):
     prompt_id = None
     output_data = []
     errors = []
+    studio_transfer_failed = False
 
     try:
         # Establish WebSocket connection
@@ -1018,6 +1027,17 @@ def handler(job):
                         errors.append(warn_msg)
                         continue
 
+                    if studio_output_requested:
+                        try:
+                            from aivyla_output_upload import upload_comfy_output
+                            output_data.append(upload_comfy_output(
+                                job_id, filename, subfolder, img_type, len(output_data)
+                            ))
+                            print(f"Aivyla: output {filename} uploaded to Studio")
+                        except Exception as exc:
+                            studio_transfer_failed = True
+                            errors.append(f"Studio direct output upload failed: {type(exc).__name__}: {exc}")
+                        continue
                     image_bytes = get_image_data(filename, subfolder, img_type)
 
                     if image_bytes:
@@ -1116,6 +1136,8 @@ def handler(job):
             print(f"worker-comfyui - Closing websocket connection.")
             ws.close()
 
+    if studio_transfer_failed:
+        return {"error": "Studio direct output upload failed", "details": errors}
     final_result = {}
 
     if output_data:
