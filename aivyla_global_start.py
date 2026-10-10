@@ -1,35 +1,36 @@
-"""Isolated Aivyla Global bootstrap; preserve base /aivyla-start.sh behavior.
+"""Isolated Aivyla Global startup using a verified compressed node bundle.
 
-The original production launcher generates /comfyui/extra_model_paths.yaml
-and patches /start.sh at runtime.  We modify only the *global container copy*
-of /start.sh first, so the same launcher can perform all GPU/Sage/node checks.
+Keep production /aivyla-start.sh unchanged in its base image; patch only its
+container-local copy for this test image. Stage source before that launcher runs.
 """
+
 from pathlib import Path
 import os
 import subprocess
-import sys
 
 START = Path('/start.sh')
-PYDIR = Path('/opt/aivyla-global')
+AIVYLA_START = Path('/aivyla-start.sh')
 CACHE = Path(os.environ.get('AIVYLA_GLOBAL_MODEL_ROOT', '/tmp/aivyla-model-cache'))
+LOCAL_NODES = Path(os.environ.get('AIVYLA_GLOBAL_NODE_ROOT', '/tmp/aivyla-node-cache'))
+LOCAL_ENABLED = os.environ.get('AIVYLA_GLOBAL_LOCAL_NODES', '1') == '1'
 
-# Python module cache + serving use the same directory; no secrets, no remote writes.
+
+def _require_tmp_directory(p: Path, label: str):
+    if not p.is_absolute() or not str(p).startswith('/tmp/') or '\n' in str(p):
+        raise RuntimeError(f'{label} must be an absolute path under /tmp')
+
+
 def patch_start():
+    _require_tmp_directory(CACHE, 'AIVYLA_GLOBAL_MODEL_ROOT')
     source = START.read_text()
     anchor = 'echo "worker-comfyui: Starting ComfyUI"'
-    if source.count(anchor) != 1:
-        raise RuntimeError('Unexpected /start.sh: cannot safely insert Global bootstrap')
-    if source.count('python -u /handler.py') != 2:
-        raise RuntimeError('Unexpected /start.sh: handler invocation count mismatch')
+    if source.count(anchor) != 1 or source.count('python -u /handler.py') != 2:
+        raise RuntimeError('Unexpected /start.sh; refusing unsafe Global patch')
 
-    # At this point the volume custom nodes have been installed and linked by
-    # /aivyla-start.sh. Replace only their code symlinks with local code copies.
-    # All heavy weights stay under /runpod-volume, until a job pre-stages them.
-    inject = '''python -u /opt/aivyla-global/aivyla_global_nodes.py || exit 1
-cat >> /comfyui/extra_model_paths.yaml <<'AIVYLAGLOBALYAML'
+    inject = '''cat >> /comfyui/extra_model_paths.yaml <<'AIVYLAGLOBALYAML'
 aivyla_global_local_cache:
   is_default: true
-  base_path: ${AIVYLA_GLOBAL_MODEL_ROOT:-/tmp/aivyla-model-cache}
+  base_path: /tmp/aivyla-model-cache
   checkpoints: checkpoints
   clip: text_encoders
   text_encoders: text_encoders
@@ -48,21 +49,40 @@ aivyla_global_local_cache:
   refmods: refmods
   h3_adaln: h3_adaln
 AIVYLAGLOBALYAML
-'''
-    # ${...} inside quoted heredoc stays literal; create actual path from env
-    # by replacing it before writing, with YAML-safe path validation.
-    path = str(CACHE)
-    if not CACHE.is_absolute() or not path.startswith('/tmp/') or '\n' in path:
-        raise RuntimeError('AIVYLA_GLOBAL_MODEL_ROOT must be an absolute /tmp path')
-    inject = inject.replace('${AIVYLA_GLOBAL_MODEL_ROOT:-/tmp/aivyla-model-cache}', path)
+'''.replace('  base_path: /tmp/aivyla-model-cache', f'  base_path: {CACHE}')
+
     source = source.replace(anchor, inject + anchor, 1)
     source = source.replace('python -u /handler.py',
                             'python -u /opt/aivyla-global/aivyla_global_handler.py')
     START.write_text(source)
     subprocess.run(['bash', '-n', str(START)], check=True)
-    print('Aivyla Global: separate worker enabled; local model paths take priority', flush=True)
+
+
+def patch_aivyla_launcher():
+    if not LOCAL_ENABLED:
+        return
+    _require_tmp_directory(LOCAL_NODES, 'AIVYLA_GLOBAL_NODE_ROOT')
+    source = AIVYLA_START.read_text()
+    old = '"$VOL/ComfyUI/custom_nodes/$node'
+    new = '"$AIVYLA_GLOBAL_NODE_ROOT/$node'
+    if source.count(old) != 3:
+        raise RuntimeError('Unexpected /aivyla-start.sh node mapping; refusing unsafe patch')
+    source = source.replace(old, new)
+    AIVYLA_START.write_text(source)
+    subprocess.run(['bash', '-n', str(AIVYLA_START)], check=True)
+    print('Aivyla Global: launcher resolves all 16 nodes from local disk', flush=True)
+
+
+def main():
+    os.environ.setdefault('AIVYLA_GLOBAL_NODE_ROOT', str(LOCAL_NODES))
+    patch_start()
+    if LOCAL_ENABLED:
+        # Verify SHA-256, copy once sequentially, then unpack the archive locally.
+        subprocess.run(['python', '-u', '/opt/aivyla-global/aivyla_global_nodes.py'], check=True)
+    patch_aivyla_launcher()
+    print('Aivyla Global v2: local-node bundle + model cache ready', flush=True)
+    os.execv('/bin/bash', ['bash', str(AIVYLA_START)])
 
 
 if __name__ == '__main__':
-    patch_start()
-    os.execv('/bin/bash', ['bash', '/aivyla-start.sh'])
+    main()
