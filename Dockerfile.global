@@ -1,0 +1,18 @@
+# Global-only image. Production image/tag is unchanged.
+ARG AIVYLA_BASE_IMAGE=ghcr.io/kathanasiadis94/worker-aivyla:aivyla-5
+FROM ${AIVYLA_BASE_IMAGE}
+
+COPY aivyla_global_start.py /opt/aivyla-global/aivyla_global_start.py
+COPY aivyla_global_nodes.py /opt/aivyla-global/aivyla_global_nodes.py
+COPY aivyla_global_cache.py /opt/aivyla-global/aivyla_global_cache.py
+COPY aivyla_global_handler.py /opt/aivyla-global/aivyla_global_handler.py
+
+RUN python -m py_compile /opt/aivyla-global/*.py
+ENV PYTHONUNBUFFERED=1 \
+    AIVYLA_GLOBAL_CACHE=1 \
+    AIVYLA_GLOBAL_LOCAL_NODES=1 \
+    AIVYLA_DYNAMIC_VRAM=0 \
+    AIVYLA_GLOBAL_CACHE_MIN_FREE_GIB=6 \
+    AIVYLA_GLOBAL_MODEL_ROOT=/tmp/aivyla-model-cache \
+    AIVYLA_GLOBAL_NODE_ROOT=/tmp/aivyla-node-cache
+CMD ["python", "/opt/aivyla-global/aivyla_global_start.py"]
