@@ -22,6 +22,7 @@ EXPECTED_SHA256 = '0f6d600452d04020fbe97886c657eb48ca6fc8ba6a548906193d0e419623c
 LOCAL = Path(os.environ.get('AIVYLA_GLOBAL_NODE_ROOT', '/tmp/aivyla-node-cache'))
 CHUNK_BYTES = 8 * 1024 * 1024
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+READY_MARKER = '.aivyla-node-bundle-sha256'
 
 
 def _expected_nodes():
@@ -46,6 +47,26 @@ def _check_root():
         raise ValueError('AIVYLA_GLOBAL_NODE_ROOT must be a non-symlink directory below /tmp')
     if not BUNDLE.is_file():
         raise FileNotFoundError(f'Global custom-node bundle missing: {BUNDLE}')
+
+
+def _already_staged(expected):
+    if not LOCAL.exists():
+        return False
+    marker = LOCAL / READY_MARKER
+    if not LOCAL.is_dir() or LOCAL.is_symlink():
+        raise RuntimeError(f'Unexpected local node cache type: {LOCAL}')
+    if not marker.is_file() or marker.read_text().strip() != EXPECTED_SHA256:
+        # v2 left no marker; delete only this isolated /tmp cache and restage.
+        print('Aivyla Global: obsolete/incomplete local node cache; restaging', flush=True)
+        shutil.rmtree(LOCAL)
+        return False
+    missing = sorted(name for name in expected if not (LOCAL / name / '__init__.py').is_file())
+    if missing:
+        print(f'Aivyla Global: incomplete local node cache ({missing}); restaging', flush=True)
+        shutil.rmtree(LOCAL)
+        return False
+    print(f'Aivyla Global nodes already staged: {len(expected)}/{len(expected)} (local cache hit)', flush=True)
+    return True
 
 
 def _stage(expected):
@@ -91,6 +112,7 @@ def _stage(expected):
             raise RuntimeError(f'Incomplete node bundle; missing __init__.py: {missing}')
         if LOCAL.exists():
             raise FileExistsError(f'Local node directory unexpectedly exists: {LOCAL}')
+        (unpack / READY_MARKER).write_text(EXPECTED_SHA256 + '\n')
         unpack.rename(LOCAL)
         print(f'Aivyla Global nodes staged locally: {len(expected)}/{len(expected)}, '
               f'{count} files, {time.monotonic() - started:.1f}s', flush=True)
@@ -101,7 +123,9 @@ def main():
         print('Aivyla Global: local node staging disabled; using original volume nodes', flush=True)
         return
     _check_root()
-    _stage(_expected_nodes())
+    expected = _expected_nodes()
+    if not _already_staged(expected):
+        _stage(expected)
 
 
 if __name__ == '__main__':

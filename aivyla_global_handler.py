@@ -1,19 +1,31 @@
-"""Run the existing production handler unchanged, after Global local staging.
+"""Wrap the production handler with per-request verified model staging.
 
-The stock /aivyla-start.sh may substitute /handler.py with diagnostics. Loading
-it at runtime preserves that behavior without duplicating 1170 lines of code.
+/handler.py is a sibling of /network_volume.py and /aivyla_output_upload.py.
+Unlike `python /handler.py`, running a wrapper under /opt does not put `/`
+on sys.path. Explicitly restore that path before loading the original file.
 """
+
 import json
+from pathlib import Path
 import runpy
-import time
+import sys
 import traceback
 
 import runpod
 
 from aivyla_global_cache import stage_workflow
 
-BASE = runpy.run_path('/handler.py', run_name='aivyla_global_base_handler')
+BASE_HANDLER_PATH = Path('/handler.py')
+BASE_DIRECTORY = str(BASE_HANDLER_PATH.parent)
+if BASE_DIRECTORY not in sys.path:
+    sys.path.insert(0, BASE_DIRECTORY)
+
+# A diagnostic handler from the network volume may have replaced /handler.py
+# during /aivyla-start.sh. Preserve exactly the handler active in this worker.
+BASE = runpy.run_path(str(BASE_HANDLER_PATH), run_name='aivyla_global_base_handler')
 base_handler = BASE['handler']
+if not callable(base_handler):
+    raise RuntimeError('Original /handler.py does not expose a callable handler')
 
 
 def handler(job):

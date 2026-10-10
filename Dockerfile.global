@@ -1,4 +1,4 @@
-# Global-only image. Production image/tag is unchanged.
+# Global-only image: production image/tag and production endpoint are unchanged.
 ARG AIVYLA_BASE_IMAGE=ghcr.io/kathanasiadis94/worker-aivyla:aivyla-5
 FROM ${AIVYLA_BASE_IMAGE}
 
@@ -8,6 +8,11 @@ COPY aivyla_global_cache.py /opt/aivyla-global/aivyla_global_cache.py
 COPY aivyla_global_handler.py /opt/aivyla-global/aivyla_global_handler.py
 
 RUN python -m py_compile /opt/aivyla-global/*.py
+
+# CPU-only BUILD-TIME import smoke test for the exact runtime handler wrapper.
+# Catch broken sibling imports (e.g. network_volume) BEFORE publishing the image.
+RUN python -c 'import runpy, sys; sys.path.insert(0, "/opt/aivyla-global"); ns = runpy.run_path("/opt/aivyla-global/aivyla_global_handler.py", run_name="aivyla_global_import_smoke"); assert callable(ns["handler"]); print("PASS: Global handler imports the real production handler and its siblings")'
+
 ENV PYTHONUNBUFFERED=1 \
     AIVYLA_GLOBAL_CACHE=1 \
     AIVYLA_GLOBAL_LOCAL_NODES=1 \
