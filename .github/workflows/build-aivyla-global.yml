@@ -41,5 +41,5 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v1
+            ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v2
             ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-${{ github.run_number }}
