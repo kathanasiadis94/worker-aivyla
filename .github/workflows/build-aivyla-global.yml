@@ -17,13 +17,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      - uses: actions/checkout@v4
+
+      # Regression tests are deliberately BEFORE the expensive Docker build.
+      - name: Set up Python 3.12 for pre-build tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test startup idempotence, imports, and node-bundle recovery
+        run: python -m unittest -v test_global_v3.py
+
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
-
-      - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
@@ -41,5 +50,5 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v2
+            ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v3
             ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-${{ github.run_number }}
