@@ -92,3 +92,5 @@ jobs:
           echo 'IMAGE=ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-faststart-ci-${{ github.run_number }}'
           echo 'DIGEST=${{ steps.build.outputs.digest }}'
           echo 'Aivyla production and all RunPod endpoints remain unchanged.'
+# Trigger isolated Aivyla CDN build
+# Trigger isolated Aivyla CDN build
