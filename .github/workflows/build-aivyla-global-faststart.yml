@@ -93,4 +93,4 @@ jobs:
           echo 'DIGEST=${{ steps.build.outputs.digest }}'
           echo 'Aivyla production and all RunPod endpoints remain unchanged.'
 # Trigger isolated Aivyla CDN build
-# Trigger isolated Aivyla CDN build
+# Trigger Universal CDN v2 isolated build
