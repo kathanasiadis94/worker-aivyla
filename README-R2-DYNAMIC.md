@@ -139,3 +139,28 @@ python3 test_global_r2.py
 
 Never overwrite `Dockerfile.global`, `aivyla_global_cache.py`, current Global
 v3 files, production `aivyla-5` or its endpoint.
+
+
+## v4.2 — isolated performance fixes (candidate, not yet deployed)
+
+* With `AIVYLA_R2_PRUNE_UNUSED=1` (default), model staging walks the
+  ComfyUI output dependency graph. It drops *known non-output* disconnected
+  branches, such as a dangling `UNETLoader`, while keeping unknown custom
+  terminal nodes and all their dependencies. With no known output, it falls
+  back to the full graph. Toggle to `0` if a custom workflow behaves
+  differently. Original workflow is never mutated before ComfyUI execution.
+* On successfully staged R2 jobs, `AIVYLA_R2_SKIP_OBJECT_INFO=1` (default)
+  skips the additional optional `/object_info` validation request that was
+  taking 10 seconds. ComfyUI still validates the prompt at queue time.
+  Toggle to `0` for the original detailed loader/LoadImage preflight.
+* Logs now separate model receipt lookup, network download, file SHA256,
+  validation and total R2 staging time. A local SHA256 hash **without** a
+  trusted receipt is not proof of a trusted expected digest.
+* Default R2 multipart parallelism is **12 streams** (previously 8). An
+  existing Runpod `AIVYLA_R2_DOWNLOAD_STREAMS=8` override wins; benchmark
+  before adopting as faster. No hard performance guarantee.
+* **Not fixed by this patch:** the independent ComfyUI cold-start/import time
+  (roughly 90s in the recorded first v4 worker). Download-only optimization
+  does not eliminate that bottleneck. Cold cache is still worker-local `/tmp`.
+* Release safety: use a NEW v4.2 image tag, test endpoint ONLY, zero active
+  workers by default. Prior Global v3 and R2 v4.1 remain unchanged.

@@ -11,6 +11,7 @@ COPY aivyla_global_r2_start.py /opt/aivyla-global/aivyla_global_r2_start.py
 RUN python -m py_compile /opt/aivyla-global/*.py
 ENV AIVYLA_R2_ENABLED=0 AIVYLA_R2_NODES_ENABLED=0 \
     AIVYLA_R2_BUCKET=aivyla-models AIVYLA_R2_CATALOG_TTL=60 \
-    AIVYLA_R2_DOWNLOAD_STREAMS=8 AIVYLA_R2_PARALLEL_MODELS=2 \
-    AIVYLA_R2_FALLBACK=1 AIVYLA_R2_NODE_PIP=0
+    AIVYLA_R2_DOWNLOAD_STREAMS=12 AIVYLA_R2_PARALLEL_MODELS=2 \
+    AIVYLA_R2_FALLBACK=1 AIVYLA_R2_NODE_PIP=0 \
+    AIVYLA_R2_PRUNE_UNUSED=1 AIVYLA_R2_SKIP_OBJECT_INFO=1
 CMD ["python", "/opt/aivyla-global/aivyla_global_r2_start.py"]

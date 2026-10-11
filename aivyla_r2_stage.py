@@ -20,6 +20,7 @@ import aivyla_global_cache as legacy
 
 CACHE = Path(os.getenv('AIVYLA_GLOBAL_MODEL_ROOT', '/tmp/aivyla-model-cache'))
 RESERVE_GIB = float(os.getenv('AIVYLA_GLOBAL_CACHE_MIN_FREE_GIB', '6'))
+PRUNE_UNUSED = os.getenv('AIVYLA_R2_PRUNE_UNUSED', '1') == '1'
 R2_ENABLED = os.getenv('AIVYLA_R2_ENABLED', '0') == '1'
 R2_FALLBACK = os.getenv('AIVYLA_R2_FALLBACK', '1') == '1'
 LOCK = threading.RLock()
@@ -98,30 +99,41 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
     temp = dst.with_name(dst.name + '.aivyla-r2-part')
     temp.unlink(missing_ok=True)
     try:
+        start_total = time.monotonic()
         expected_sha = _receipt_sha(registry().client, registry().bucket, model.key, model.bytes, model.etag)
+        receipt_s = time.monotonic() - start_total
         from boto3.s3.transfer import TransferConfig
-        concurrency = int(os.getenv('AIVYLA_R2_DOWNLOAD_STREAMS', '8'))
+        concurrency = int(os.getenv('AIVYLA_R2_DOWNLOAD_STREAMS', '12'))
         concurrency = max(1, min(24, concurrency))
         config = TransferConfig(multipart_threshold=32*1024**2,
                                 multipart_chunksize=32*1024**2,
                                 max_concurrency=concurrency, use_threads=True)
         started = time.monotonic()
         registry().client.download_file(registry().bucket, model.key, str(temp), Config=config)
+        transfer_s = time.monotonic() - started
         if temp.stat().st_size != model.bytes:
             raise R2IntegrityError(f'R2 download incomplete: {model.key}')
+        hash_started = time.monotonic()
         digest = _hash(temp)
+        hash_s = time.monotonic() - hash_started
         if expected_sha and digest != expected_sha:
             raise R2IntegrityError(f'R2 SHA256 mismatch: {model.key}')
+        verify_started = time.monotonic()
         if temp.suffix.lower() == '.safetensors' or dst.suffix.lower() == '.safetensors':
             legacy._validate_safetensors(temp)
         # Refuse object updates during download: do not cache a mixed/version-changing file.
         head = registry().client.head_object(Bucket=registry().bucket, Key=model.key)
         if head['ContentLength'] != model.bytes or head['ETag'].strip('"') != model.etag:
             raise R2IntegrityError(f'R2 model changed while downloading: {model.key}')
+        verify_s = time.monotonic() - verify_started
         os.replace(temp, dst)
         _atomic_manifest(dst, fp, digest)
         print(f'Aivyla R2 MODEL {model.category}/{model.filename}: '
-              f'{model.bytes/1024**3:.2f} GiB in {time.monotonic()-started:.1f}s (SHA256 OK)', flush=True)
+              f'{model.bytes/1024**3:.2f} GiB; receipt={receipt_s:.2f}s '
+              f'download={transfer_s:.2f}s sha256={hash_s:.2f}s '
+              f'verify={verify_s:.2f}s total={time.monotonic()-start_total:.2f}s '
+              f'checksum={"trusted_sha256_pass" if expected_sha else "local_sha256_only"} '
+              f'workers={concurrency}', flush=True)
         return 'r2'
     except Exception as exc:
         temp.unlink(missing_ok=True)
@@ -190,6 +202,99 @@ def _copy_volume(src, dst):
         temp.unlink(missing_ok=True)
 
 
+
+# Conservative ComfyUI execution-graph pruning. These are confirmed output
+# classes. Unknown terminal classes are always retained: a custom node may
+# have OUTPUT_NODE=True even if the worker does not know that class.
+KNOWN_OUTPUTS = frozenset({
+    'SaveImage', 'PreviewImage', 'SaveAnimatedPNG', 'SaveAnimatedWEBP',
+    'SaveVideo', 'SaveAudio', 'SaveImageWebsocket', 'VHS_VideoCombine',
+})
+# Core ComfyUI classes known *not* to have side-effect output behavior.
+# Only use this list to prune disconnected terminal branches. Do not guess
+# about custom node classes or skip an unknown output node.
+NON_OUTPUT_TERMINALS = frozenset({
+    'CheckpointLoaderSimple', 'CheckpointLoader', 'UNETLoader', 'UnetLoaderGGUF',
+    'LoraLoader', 'LoraLoaderModelOnly', 'VAELoader', 'CLIPLoader',
+    'DualCLIPLoader', 'TripleCLIPLoader', 'UpscaleModelLoader',
+    'KSampler', 'KSamplerAdvanced', 'CLIPTextEncode', 'CLIPTextEncodeSDXL',
+    'VAEDecode', 'VAEEncode', 'EmptyLatentImage', 'EmptyImage',
+    'LoadImage', 'LoadImageMask',
+})
+
+
+def _active_workflow(workflow):
+    """Return a safe output-connected node subset; full workflow on ambiguity.
+
+    Never remove custom/unknown terminal classes (potential OUTPUT_NODEs).
+    With no recognized output we cannot tell which custom node executes, so
+    retain the entire workflow. Graph cycles / malformed links also disable
+    pruning rather than silently causing missing model downloads.
+    """
+    if not PRUNE_UNUSED or not isinstance(workflow, dict) or len(workflow) > 20000:
+        return workflow, 0
+    nodes = {str(k): v for k, v in workflow.items()
+             if isinstance(v, dict) and isinstance(v.get('inputs'), dict)}
+    if len(nodes) != len(workflow):
+        return workflow, 0
+    outputs = {k for k, v in nodes.items() if v.get('class_type') in KNOWN_OUTPUTS}
+    if not outputs:
+        return workflow, 0
+    parents = {}
+    referenced = set()
+
+    def collect_dependencies(value, depth=0):
+        """Follow ordinary and nested ComfyUI links; fail safe on ambiguity."""
+        if depth > 16:
+            return set(), True
+        if isinstance(value, (list, tuple)):
+            if (len(value) == 2 and isinstance(value[0], (str, int))
+                    and isinstance(value[1], int) and not isinstance(value[1], bool)
+                    and value[1] >= 0):
+                name = str(value[0])
+                return ({name}, False) if name in nodes else (set(), True)
+            links = set()
+            for subvalue in value:
+                found, bad = collect_dependencies(subvalue, depth + 1)
+                if bad:
+                    return set(), True
+                links.update(found)
+            return links, False
+        if isinstance(value, dict):
+            links = set()
+            for subvalue in value.values():
+                found, bad = collect_dependencies(subvalue, depth + 1)
+                if bad:
+                    return set(), True
+                links.update(found)
+            return links, False
+        return set(), False
+
+    for node_id, node in nodes.items():
+        deps = set()
+        for value in node['inputs'].values():
+            found, bad = collect_dependencies(value)
+            if bad:
+                return workflow, 0
+            deps.update(found)
+        parents[node_id] = deps
+        referenced.update(deps)
+    unknown_terminals = {k for k, v in nodes.items()
+                         if k not in referenced and v.get('class_type') not in NON_OUTPUT_TERMINALS}
+    stack = list(outputs | unknown_terminals)
+    active = set()
+    while stack:
+        current = stack.pop()
+        if current in active:
+            continue
+        active.add(current)
+        stack.extend(parents[current] - active)
+    if not active:
+        return workflow, 0
+    pruned = len(nodes) - len(active)
+    return {k: v for k, v in workflow.items() if str(k) in active}, pruned
+
+
 def _referenced(workflow):
     results = {}
     catalog = registry() if R2_ENABLED else None
@@ -227,10 +332,14 @@ def _referenced(workflow):
 def stage_workflow(workflow):
     if not R2_ENABLED:
         return legacy.stage_workflow(workflow)
+    start_total = time.monotonic()
     with LOCK:
         if not CACHE.is_absolute() or not str(CACHE).startswith('/tmp/'):
             raise RuntimeError('Model cache must be under /tmp')
-        jobs = _referenced(workflow)
+        active_workflow, pruned_nodes = _active_workflow(workflow)
+        start_discovery = time.monotonic()
+        jobs = _referenced(active_workflow)
+        discovery_s = time.monotonic() - start_discovery
         free = shutil.disk_usage('/tmp').free
         required = 0
         for category, filename, model, src, categories in jobs:
@@ -256,6 +365,10 @@ def stage_workflow(workflow):
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
             for result in pool.map(fetch, jobs):
                 counts[result] += 1
+        elapsed_s = time.monotonic() - start_total
         print(f'Aivyla R2 stage: models={len(jobs)} r2={counts["r2"]} '
-              f'global={counts["global"]} cached={counts["hit"]}', flush=True)
-        return {'enabled': True, 'models': len(jobs), **counts}
+              f'global={counts["global"]} cached={counts["hit"]} '
+              f'pruned_nodes={pruned_nodes} discovery={discovery_s:.2f}s '
+              f'total={elapsed_s:.2f}s', flush=True)
+        return {'enabled': True, 'models': len(jobs), 'pruned_nodes': pruned_nodes,
+                'discovery_s': round(discovery_s, 3), 'total_s': round(elapsed_s, 3), **counts}

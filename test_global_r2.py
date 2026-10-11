@@ -299,5 +299,153 @@ class TestV4Integration(unittest.TestCase):
                     node_stage._install_requirements(root)
 
 
+class TestV42GraphPruning(unittest.TestCase):
+    """Disconnected model branches must not cause R2 download when outputs are known."""
+    def setUp(self):
+        self.fake = FakeS3()
+        self.fake.add('models/diffusion_models/huge.safetensors', sf())
+        self.fake.add('models/loras/used.safetensors', sf())
+        stage._registry = Registry(self.fake, ttl=0)
+        temp = tempfile.TemporaryDirectory(prefix='aivyla-r2-prune-', dir='/tmp')
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name)
+        self.old = (stage.CACHE, stage.R2_ENABLED, stage.RESERVE_GIB, stage.PRUNE_UNUSED)
+        self.addCleanup(lambda: self._restore())
+        stage.CACHE = self.tmp/'cache'
+        stage.R2_ENABLED = True
+        stage.RESERVE_GIB = 0
+        stage.PRUNE_UNUSED = True
+
+    def _restore(self):
+        stage.CACHE, stage.R2_ENABLED, stage.RESERVE_GIB, stage.PRUNE_UNUSED = self.old
+
+    def test_exact_smoke_unused_unet_is_not_fetched(self):
+        workflow = {
+            '1': {'class_type':'UNETLoader', 'inputs':{'unet_name':'huge.safetensors'}},
+            '2': {'class_type':'EmptyImage', 'inputs':{'width':128,'height':128}},
+            '3': {'class_type':'SaveImage', 'inputs':{'images':['2',0]}},
+        }
+        result = stage.stage_workflow(workflow)
+        self.assertEqual(result['models'],0)
+        self.assertEqual(result['pruned_nodes'],1)
+        self.assertEqual(self.fake.calls,[])
+        self.assertEqual(len(workflow),3, 'never mutate original workflow')
+
+    def test_connected_model_still_downloads(self):
+        workflow = {
+            '1':{'class_type':'LoraLoader', 'inputs':{'lora_name':'used.safetensors'}},
+            '2':{'class_type':'SaveImage', 'inputs':{'images':['1',0]}},
+        }
+        result = stage.stage_workflow(workflow)
+        self.assertEqual(result['r2'],1)
+        self.assertEqual(result['pruned_nodes'],0)
+        self.assertEqual(self.fake.calls,['models/loras/used.safetensors'])
+
+    def test_unknown_custom_output_branch_is_preserved(self):
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'MyCustomVideoSaver','inputs':{'frames':['1',0]}},
+            '3':{'class_type':'EmptyImage','inputs':{}},
+            '4':{'class_type':'SaveImage','inputs':{'images':['3',0]}},
+        }
+        result = stage.stage_workflow(workflow)
+        self.assertEqual(result['r2'],1)
+        self.assertEqual(result['pruned_nodes'],0)
+
+    def test_unknown_only_outputs_fall_back_to_full_graph(self):
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'MyCustomVideoSaver','inputs':{}},
+        }
+        selected, pruned = stage._active_workflow(workflow)
+        self.assertEqual(pruned,0)
+        self.assertEqual(selected, workflow)
+
+    def test_disabled_pruning_preserves_old_behavior(self):
+        stage.PRUNE_UNUSED = False
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'SaveImage','inputs':{'images':['3',0]}},
+            '3':{'class_type':'EmptyImage','inputs':{}},
+        }
+        result = stage.stage_workflow(workflow)
+        self.assertEqual(result['r2'],1)
+        self.assertEqual(result['pruned_nodes'],0)
+
+    def test_nested_custom_links_keep_model_dependency(self):
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'SaveImage','inputs':{'images':{'groups':[['1',0]]}}},
+        }
+        selected, pruned = stage._active_workflow(workflow)
+        self.assertEqual(pruned,0)
+        self.assertIn('1',selected)
+
+    def test_nested_missing_link_disables_pruning(self):
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'SaveImage','inputs':{'images':{'groups':[['99',0]]}}},
+        }
+        selected, pruned = stage._active_workflow(workflow)
+        self.assertEqual(pruned,0)
+        self.assertEqual(selected,workflow)
+
+    def test_missing_link_preserves_full_graph(self):
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'SaveImage','inputs':{'images':['99',0]}},
+        }
+        selected, pruned = stage._active_workflow(workflow)
+        self.assertEqual(pruned,0)
+        self.assertEqual(selected,workflow)
+
+    def test_disconnected_non_output_sampler_chain_removed(self):
+        workflow = {
+            '1':{'class_type':'UNETLoader','inputs':{'unet_name':'huge.safetensors'}},
+            '2':{'class_type':'KSampler','inputs':{'model':['1',0]}},
+            '3':{'class_type':'EmptyImage','inputs':{}},
+            '4':{'class_type':'SaveImage','inputs':{'images':['3',0]}},
+        }
+        selected, pruned = stage._active_workflow(workflow)
+        self.assertEqual(pruned,2)
+        self.assertEqual(list(selected),['3','4'])
+
+    def test_metrics_have_nonnegative_times(self):
+        workflow = {'1':{'class_type':'LoraLoader','inputs':{'lora_name':'used.safetensors'}},
+                    '2':{'class_type':'SaveImage','inputs':{'images':['1',0]}}}
+        result = stage.stage_workflow(workflow)
+        self.assertGreaterEqual(result['total_s'],0)
+        self.assertGreaterEqual(result['discovery_s'],0)
+
+
+class TestV42FastPreflight(unittest.TestCase):
+    def test_skip_only_when_r2_enabled(self):
+        """Load the wrapper with a fake handler; never import production code."""
+        import importlib.util
+        scope = {}
+        source = (
+            "def validate_workflow_models(workflow):\n"
+            "    return 'original'\n"
+            "def handler(job):\n"
+            "    return validate_workflow_models(job['input']['workflow'])\n"
+        )
+        exec(source, scope)
+        base = scope['handler']
+        fake_runpod = types.ModuleType('runpod')
+        with mock.patch.dict(sys.modules, {'runpod':fake_runpod}), \
+             mock.patch('runpy.run_path',return_value={'handler':base}):
+            spec=importlib.util.spec_from_file_location(
+                'aivyla_r2_handler_v42_test', HERE/'aivyla_global_r2_handler.py')
+            mod=importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        payload={'input':{'workflow':{}}}
+        with mock.patch.dict(os.environ, {'AIVYLA_R2_ENABLED':'1','AIVYLA_R2_SKIP_OBJECT_INFO':'1'}):
+            self.assertIsNone(base(payload))
+        with mock.patch.dict(os.environ, {'AIVYLA_R2_ENABLED':'0','AIVYLA_R2_SKIP_OBJECT_INFO':'1'}):
+            self.assertEqual(base(payload),'original')
+        with mock.patch.dict(os.environ, {'AIVYLA_R2_ENABLED':'1','AIVYLA_R2_SKIP_OBJECT_INFO':'0'}):
+            self.assertEqual(base(payload),'original')
+
+
 if __name__=='__main__':
     unittest.main(verbosity=2)
