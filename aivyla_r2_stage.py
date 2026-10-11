@@ -109,7 +109,21 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
                                 multipart_chunksize=32*1024**2,
                                 max_concurrency=concurrency, use_threads=True)
         started = time.monotonic()
-        registry().client.download_file(registry().bucket, model.key, str(temp), Config=config)
+        transport = 'direct_r2'
+        if (os.getenv('AIVYLA_CDN_PILOT_ENABLED', '0') == '1'
+                and model.key == 'models/split_files/diffusion_models/krea2_turbo_fp8_scaled.safetensors'):
+            try:
+                from aivyla_cdn_stage import download_file, CDNIntegrityError
+                download_file(model, temp)
+                transport = 'cdn'
+            except CDNIntegrityError as exc:
+                raise R2IntegrityError(str(exc)) from exc
+            except Exception as exc:
+                # Discard incomplete CDN bytes; retain verified direct-R2 fallback.
+                temp.unlink(missing_ok=True)
+                print(f'Aivyla CDN unavailable ({type(exc).__name__}); using direct R2', flush=True)
+        if transport == 'direct_r2':
+            registry().client.download_file(registry().bucket, model.key, str(temp), Config=config)
         transfer_s = time.monotonic() - started
         if temp.stat().st_size != model.bytes:
             raise R2IntegrityError(f'R2 download incomplete: {model.key}')
@@ -133,7 +147,7 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
               f'download={transfer_s:.2f}s sha256={hash_s:.2f}s '
               f'verify={verify_s:.2f}s total={time.monotonic()-start_total:.2f}s '
               f'checksum={"trusted_sha256_pass" if expected_sha else "local_sha256_only"} '
-              f'workers={concurrency}', flush=True)
+              f'workers={concurrency} transport={transport}', flush=True)
         return 'r2'
     except Exception as exc:
         temp.unlink(missing_ok=True)

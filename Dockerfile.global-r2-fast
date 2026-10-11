@@ -3,7 +3,7 @@
 FROM ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v3
 RUN python -m pip install --no-cache-dir 'boto3>=1.34,<2' \
  && python -m pip check
-COPY aivyla_r2_registry.py aivyla_r2_stage.py aivyla_r2_nodes.py aivyla_global_r2_handler.py aivyla_global_r2_start.py aivyla_global_nodes.py aivyla_fast_requirements.py aivyla_fast_start.py /opt/aivyla-global/
+COPY aivyla_r2_registry.py aivyla_r2_stage.py aivyla_cdn_stage.py aivyla_r2_nodes.py aivyla_global_r2_handler.py aivyla_global_r2_start.py aivyla_global_nodes.py aivyla_fast_requirements.py aivyla_fast_start.py /opt/aivyla-global/
 RUN python -m py_compile /opt/aivyla-global/*.py
 ENV AIVYLA_FAST_REQUIREMENTS=1 \
     AIVYLA_R2_ENABLED=0 AIVYLA_R2_NODES_ENABLED=0 \
