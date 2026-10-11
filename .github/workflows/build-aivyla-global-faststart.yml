@@ -1,0 +1,94 @@
+name: Aivyla Global FastStart - isolated CI image
+
+# Deliberately isolated: one push containing this new workflow triggers pre-build checks.
+# Subsequent candidate code changes do not automatically trigger new GPU/CI costs.
+on:
+  push:
+    branches:
+      - aivyla-global
+    paths:
+      - '.github/workflows/build-aivyla-global-faststart.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: aivyla-global-faststart-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-build-faststart:
+    name: CPU regressions then isolated amd64 image
+    if: github.ref == 'refs/heads/aivyla-global'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate isolated build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYVERIFY'
+          from pathlib import Path
+          dockerfile = Path('Dockerfile.global-r2-fast').read_text()
+          assert 'FROM ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v3' in dockerfile
+          assert 'CMD ["python", "/opt/aivyla-global/aivyla_fast_start.py"]' in dockerfile
+          for name in ('aivyla_fast_start.py','aivyla_fast_requirements.py','aivyla_global_r2_start.py','aivyla_r2_stage.py'):
+              assert Path(name).is_file(), name
+          print('PASS: isolated FastStart source and Dockerfile')
+          PYVERIFY
+          python -m py_compile aivyla_fast_start.py aivyla_fast_requirements.py aivyla_global_r2_start.py aivyla_r2_stage.py
+
+      - name: Run all three CPU regression suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python test_fast_start.py
+          python test_global_r2.py
+          python test_global_v3.py
+
+      - name: Free runner disk for existing large base image
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker system df || true
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish separate FastStart test tag
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.global-r2-fast
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-faststart-ci-${{ github.run_number }}
+
+      - name: Show result - no RunPod deployment
+        shell: bash
+        run: |
+          echo 'IMAGE=ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-faststart-ci-${{ github.run_number }}'
+          echo 'DIGEST=${{ steps.build.outputs.digest }}'
+          echo 'Aivyla production and all RunPod endpoints remain unchanged.'
