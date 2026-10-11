@@ -110,7 +110,18 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
                                 max_concurrency=concurrency, use_threads=True)
         started = time.monotonic()
         transport = 'direct_r2'
-        if (os.getenv('AIVYLA_CDN_PILOT_ENABLED', '0') == '1'
+        if os.getenv('AIVYLA_CDN_V2_ENABLED', '0') == '1':
+            try:
+                from aivyla_cdn_v2_stage import download_file, CDNIntegrityError
+                download_file(model, temp)
+                transport = 'cdn_v2'
+            except (CDNIntegrityError, ValueError) as exc:
+                raise R2IntegrityError(str(exc)) from exc
+            except Exception as exc:
+                # Only availability/transport errors fall back to verified R2.
+                temp.unlink(missing_ok=True)
+                print(f'Aivyla CDN v2 unavailable ({type(exc).__name__}); using direct R2', flush=True)
+        elif (os.getenv('AIVYLA_CDN_PILOT_ENABLED', '0') == '1'
                 and model.key == 'models/split_files/diffusion_models/krea2_turbo_fp8_scaled.safetensors'):
             try:
                 from aivyla_cdn_stage import download_file, CDNIntegrityError
