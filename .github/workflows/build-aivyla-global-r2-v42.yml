@@ -88,3 +88,4 @@ jobs:
           echo "R2 test image: ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-r2-v4-2-${{ github.run_number }}"
           echo "Image digest: ${{ steps.build.outputs.digest }}"
           echo "No Runpod endpoint was updated. Global v3, R2 v4.1 and production are unchanged."
+          # rebuild v4.2
