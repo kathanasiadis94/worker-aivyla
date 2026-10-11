@@ -104,8 +104,21 @@ def _stage(expected):
                     raise ValueError(f'Unsafe or unexpected node archive entry: {member.name!r}')
                 if member.isfile():
                     count += 1
-            # Python 3.12's data filter rejects unsafe extraction metadata.
-            archive.extractall(path=unpack, filter='data')
+            # The archive is pinned by SHA256, and entries above were verified
+            # to be regular files/directories within expected node directories.
+            # Manual extraction remains safe on Python 3.9 (no `filter` API).
+            for member in members:
+                target = unpack.joinpath(*PurePosixPath(member.name).parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    reader = archive.extractfile(member)
+                    if reader is None:
+                        raise ValueError(f'Cannot read bundled node file: {member.name!r}')
+                    with reader, target.open('xb') as writer:
+                        shutil.copyfileobj(reader, writer, length=1024*1024)
+                    target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
         missing = sorted(name for name in expected if not (unpack / name / '__init__.py').is_file())
         if missing:
