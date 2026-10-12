@@ -9,6 +9,7 @@ import requests
 import base64
 from io import BytesIO
 import websocket
+from aivyla_preview import PreviewPublisher
 import uuid
 import tempfile
 import socket
@@ -871,6 +872,10 @@ def handler(job):
         print(f"worker-comfyui - Workflow model pre-flight failed:\n{preflight_error}")
         return {"error": preflight_error}
 
+    preview = PreviewPublisher(
+        job_id, enabled=isinstance(job_input, dict)
+        and job_input.get("live_preview") is True,
+    )
     ws = None
     client_id = str(uuid.uuid4())
     prompt_id = None
@@ -900,6 +905,7 @@ def handler(job):
                     f"Missing 'prompt_id' in queue response: {queued_workflow}"
                 )
             print(f"worker-comfyui - Queued workflow with ID: {prompt_id}")
+            preview.prompt_id = prompt_id
         except requests.RequestException as e:
             print(f"worker-comfyui - Error queuing workflow: {e}")
             raise ValueError(f"Error queuing workflow: {e}")
@@ -919,6 +925,7 @@ def handler(job):
                 out = ws.recv()
                 if isinstance(out, str):
                     message = json.loads(out)
+                    preview.event(message.get("type"), message.get("data") or {})
                     if message.get("type") == "status":
                         status_data = message.get("data", {}).get("status", {})
                         print(
@@ -945,6 +952,7 @@ def handler(job):
                             errors.append(f"Workflow execution error: {error_details}")
                             break
                 else:
+                    preview.image(out)
                     continue
             except websocket.WebSocketTimeoutException:
                 print(f"worker-comfyui - Websocket receive timed out. Still waiting...")
@@ -1132,6 +1140,7 @@ def handler(job):
         print(traceback.format_exc())
         return {"error": f"An unexpected error occurred: {e}"}
     finally:
+        preview.close()
         if ws and ws.connected:
             print(f"worker-comfyui - Closing websocket connection.")
             ws.close()

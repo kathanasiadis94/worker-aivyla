@@ -189,6 +189,7 @@ from pathlib import Path
 import os, re
 dynamic_vram = os.environ.get("AIVYLA_DYNAMIC_VRAM", "0") == "1"
 sage = os.environ.get("AIVYLA_SAGE") == "1"
+preview_enabled = os.environ.get("AIVYLA_LIVE_PREVIEW_ENABLED", "false").lower() == "true"
 source = Path("/start.sh").read_text()
 pattern = re.compile(r"(?m)^(?P<prefix>[ \t]*python[ \t]+-u[ \t]+/comfyui/main\.py)(?P<args>[^\n]*)$")
 if len(pattern.findall(source)) != 2:
@@ -199,6 +200,9 @@ def patch(m):
         args.insert(0, "--disable-dynamic-vram")
     if sage:
         args.insert(0, "--use-sage-attention")
+    if preview_enabled:
+        args.insert(0, "--preview-size 256")
+        args.insert(0, "--preview-method auto")
     return m.group("prefix") + "".join(" " + a for a in args)
 Path("/tmp/aivyla-worker-start.sh").write_text(pattern.sub(patch, source))
 print(f"Aivyla: launcher ready; Sage={'ON' if sage else 'OFF'}; DynamicVRAM={'ON' if dynamic_vram else 'OFF'}")
