@@ -1,11 +1,14 @@
 """Opt-in Aivyla Global R2 fast-start wrapper. Never patches production source.
 
 Preserves R2 v4.2 handler, SageAttention GPU tests and full pip fallback.
+Live previews are enabled only when AIVYLA_LIVE_PREVIEW_ENABLED=true on the
+Global Runpod endpoint; otherwise the ComfyUI launcher remains unchanged.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -30,6 +33,42 @@ def patch_requirements(path: Path) -> None:
         raise RuntimeError('Aivyla startup requirements anchor drift; refuse fast-start patch')
     path.write_text(source.replace(ORIGINAL, FAST, 1))
     subprocess.run(['bash', '-n', str(path)], check=True)
+
+
+def configure_comfy_preview(path: Path) -> None:
+    """Patch only the Global container's runtime /start.sh, not the image source.
+
+    The existing /aivyla-start.sh reads /start.sh to produce its final launcher.
+    Its SageAttention/dynamic-VRAM logic preserves the extra preview arguments.
+    """
+    if os.getenv('AIVYLA_LIVE_PREVIEW_ENABLED', 'false').lower() != 'true':
+        return
+
+    source = path.read_text()
+    pattern = re.compile(
+        r'(?m)^(?P<prefix>[ \t]*python[ \t]+-u[ \t]+/comfyui/main\.py)(?P<args>[^\n]*)$'
+    )
+    matches = list(pattern.finditer(source))
+    if len(matches) != 2:
+        raise RuntimeError('Global preview: expected exactly two ComfyUI launcher commands')
+
+    flags = '--preview-method auto --preview-size 256'
+
+    def patch(match):
+        prefix, args = match.group('prefix'), match.group('args')
+        if flags in args:
+            return prefix + args  # Already enabled: idempotent.
+        if '--preview-method' in args or '--preview-size' in args:
+            raise RuntimeError('Global preview: conflicting ComfyUI preview flags')
+        return prefix + ' ' + flags + args
+
+    updated = pattern.sub(patch, source)
+    # Validate before writing anything; this only changes the container's
+    # launcher and never touches the network volume or repository.
+    subprocess.run(['bash', '-n', '-'], input=updated, text=True, check=True)
+    if updated != source:
+        path.write_text(updated)
+    print('Aivyla Global FastStart: low-resolution ComfyUI previews enabled', flush=True)
 
 
 def baked_nodes_available(root: Path, nodes_file: Path) -> bool:
@@ -95,6 +134,7 @@ def main() -> None:
         from aivyla_r2_nodes import install_enabled_nodes
         install_enabled_nodes()
     patch_requirements(v3.AIVYLA_START)
+    configure_comfy_preview(v3.START)
     phase('launcher_patch', started)
     phase('bootstrap_total_before_comfy', total)
     os.execv('/bin/bash', ['bash', str(v3.AIVYLA_START)])
