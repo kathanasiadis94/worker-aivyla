@@ -18,8 +18,10 @@ from aivyla_output_upload import _settings
 log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 240_000
-MIN_IMAGE_INTERVAL_S = 2.5
-MIN_PROGRESS_INTERVAL_S = 1.0
+MAX_ANIMATION_BYTES = 900_000  # 1.2 MB base64 max, bounded POST to Studio
+MIN_IMAGE_INTERVAL_S = 1.0
+MIN_ANIMATION_INTERVAL_S = 0.8
+MIN_PROGRESS_INTERVAL_S = 0.5
 
 
 def decode_preview(packet):
@@ -51,9 +53,11 @@ class PreviewPublisher:
         self.step = None
         self.total = None
         self.last_image_at = 0.0
+        self.last_animation_at = 0.0
         self.last_progress_at = 0.0
         self._queue = queue.Queue(maxsize=2)
         self._thread = None
+        self._relay_failures = 0
         if not self.enabled:
             return
         try:
@@ -88,6 +92,12 @@ class PreviewPublisher:
     def event(self, kind, data):
         if not self.enabled or not isinstance(data, dict):
             return
+        # KJNodes sends this event to the current ComfyUI WebSocket client,
+        # omitting prompt_id. The handler owns one WebSocket per RunPod request;
+        # relay only after that request's prompt_id is known.
+        if kind == "kj_preview_override":
+            self._kj_preview(data)
+            return
         actual_prompt = data.get("prompt_id")
         if self.prompt_id and actual_prompt != self.prompt_id:
             return
@@ -109,6 +119,58 @@ class PreviewPublisher:
             "step": self.step,
             "total": self.total,
         })
+
+    def _kj_preview(self, data):
+        if not self.enabled or not self.prompt_id:
+            return
+        now = time.monotonic()
+        node_id = data.get("node_id")
+        if not isinstance(node_id, str) or not node_id.startswith("aivyla_kj_anim_"):
+            return  # Ignore unrelated custom KJ previews from other workflows.
+        if node_id is not None:
+            self.node = str(node_id)[:128]
+        step, total = data.get("step"), data.get("total")
+        if type(step) is int and type(total) is int and 0 <= step <= total <= 100_000:
+            self.step, self.total = step, total
+        mime = data.get("mime")
+        encoded = data.get("image")
+        if mime in ("video/mp4", "image/webp") and isinstance(encoded, str):
+            if now - self.last_animation_at < MIN_ANIMATION_INTERVAL_S:
+                return
+            # The Studio independently checks base64 and container signatures.
+            # No binary conversion in the websocket receive thread.
+            if not 0 < len(encoded) <= ((MAX_ANIMATION_BYTES + 2) // 3) * 4 + 4:
+                log.warning("Skipping oversized animated preview (%d base64 chars)", len(encoded))
+                return
+            if self.last_animation_at == 0:
+                print(f"Aivyla animation relay: first {mime} clip, {len(encoded)} base64 chars", flush=True)
+            self.last_animation_at = now
+            self._push({
+                "type": "animation",
+                "prompt_id": self.prompt_id,
+                "node": self.node,
+                "step": self.step,
+                "total": self.total,
+                "mime": mime,
+                "animation_base64": encoded,
+                "fps": data.get("fps") or 8,
+            })
+        elif mime == "image/jpeg" and isinstance(encoded, str):
+            if now - self.last_image_at < MIN_IMAGE_INTERVAL_S:
+                return
+            if 0 < len(encoded) <= ((MAX_IMAGE_BYTES + 2) // 3) * 4 + 4:
+                self.last_image_at = now
+                self._push({
+                    "type": "preview", "prompt_id": self.prompt_id,
+                    "node": self.node, "step": self.step, "total": self.total,
+                    "mime": "image/jpeg", "image_base64": encoded,
+                })
+        elif now - self.last_progress_at >= MIN_PROGRESS_INTERVAL_S:
+            self.last_progress_at = now
+            self._push({
+                "type": "progress", "prompt_id": self.prompt_id,
+                "node": self.node, "step": self.step, "total": self.total,
+            })
 
     def image(self, packet):
         if not self.enabled or not self.prompt_id:
@@ -143,6 +205,9 @@ class PreviewPublisher:
                     headers={"X-Aivyla-Output-Key": self.secret},
                     timeout=(3, 5),
                 )
+                if response.status_code == 413 and item.get("type") == "animation":
+                    log.warning("Studio rejected oversized animated preview; keeping progress relay")
+                    continue
                 if response.status_code in (401, 403, 404, 405, 413):
                     log.warning(
                         "Disabling preview relay: Studio HTTP %s",
@@ -151,11 +216,14 @@ class PreviewPublisher:
                     self.enabled = False
                     return
                 response.raise_for_status()
+                self._relay_failures = 0
             except requests.RequestException as exc:
-                log.debug(
-                    "Skipping preview update due to relay failure: %s",
-                    type(exc).__name__,
-                )
+                self._relay_failures += 1
+                if self._relay_failures == 1 or self._relay_failures % 10 == 0:
+                    log.warning(
+                        "Preview relay failure (%d): %s; generation continues",
+                        self._relay_failures, type(exc).__name__,
+                    )
 
     def close(self):
         if self._thread is None:
