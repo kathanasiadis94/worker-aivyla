@@ -127,11 +127,21 @@ def download_file(model, destination: Path):
                             raise CDNIntegrityError('Overlong CDN v2 part')
                         return
                 except urllib.error.HTTPError as error:
-                    if error.code in (403, 404, 409, 412, 416):
-                        raise CDNIntegrityError(f'CDN v2 rejected model identity: {error.code}') from error
-                    if error.code == 401 and attempt < 2:
+                    if error.code in (401, 403) and attempt < 2:
+                        # Rotate the CDN grant once rejected; preserve the full
+                        # original R2 integrity checks on any subsequent fallback.
                         tokens.get(rejected=token)
                         continue
+                    if error.code == 403:
+                        # Access denial is not proof of corrupt model bytes.
+                        # Raise an ordinary error to trigger verified direct R2.
+                        ray = error.headers.get('CF-Ray', 'unknown') if error.headers else 'unknown'
+                        raise RuntimeError(
+                            f'CDN v2 HTTP 403 after token refresh: '
+                            f'{model.key}, part={index}, cf_ray={ray}') from error
+                    if error.code in (404, 409, 412, 416):
+                        # Object identity/version/range problems fail closed.
+                        raise CDNIntegrityError(f'CDN v2 rejected model identity: {error.code}') from error
                     if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
                         raise
                 except (TimeoutError, ConnectionError, OSError):

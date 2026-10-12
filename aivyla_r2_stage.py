@@ -320,10 +320,23 @@ def _active_workflow(workflow):
     return {k: v for k, v in workflow.items() if str(k) in active}, pruned
 
 
+def _model_location(name, field):
+    """Canonical loader destination; original R2 source may use a legacy category.
+
+    The exact requested filename is mandatory; no model substitution.
+    """
+    if name == 'LatentUpscaleModelLoader' and field == 'model_name':
+        return 'latent_upscale_models', ['latent_upscale_models', 'upscale_models'], True
+    if name == 'LTXVAudioVAELoader' and field == 'ckpt_name':
+        return 'checkpoints', ['checkpoints', 'diffusion_models'], True
+    return None, legacy._possible_categories(name, field), False
+
+
 def _referenced(workflow):
     results = {}
     catalog = registry() if R2_ENABLED else None
     # Resolve R2 entries independently of FUSE metadata operations.
+    h3_pruned = False
     for node in workflow.values():
         if not isinstance(node, dict) or not isinstance(node.get('inputs'), dict):
             continue
@@ -332,7 +345,10 @@ def _referenced(workflow):
             if not legacy._model_filename(filename) or field.lower() in (
                     'prompt','text','negative','positive','image','audio','video','filename','file'):
                 continue
-            categories = legacy._possible_categories(name, field)
+            target, categories, required = _model_location(name, field)
+            lower = filename.lower()
+            if 'minimax' in lower and 'h3' in lower and 'pruned' in lower:
+                h3_pruned = True
             try:
                 model = catalog.find(filename, categories) if catalog else None
             except Exception:
@@ -342,13 +358,41 @@ def _referenced(workflow):
                     raise
                 model = None
             if model:
-                results[(model.category, filename)] = (model.category, filename, model, None, categories)
+                destination = target or model.category
+                results[(destination, filename)] = (
+                    destination, filename, model, None, categories)
                 continue
             source = legacy._find_source(filename, categories)
             if source:
-                results[(source[0], filename)] = (source[0], filename, None, source[1], categories)
-            elif name in legacy.KNOWN and field in legacy.KNOWN[name][1]:
-                raise FileNotFoundError(f'Model not in R2 or Global Volume: {name}.{field}={filename}')
+                destination = target or source[0]
+                results[(destination, filename)] = (
+                    destination, filename, None, source[1], categories)
+            elif required or (name in legacy.KNOWN and field in legacy.KNOWN[name][1]):
+                raise FileNotFoundError(
+                    f'Model not in R2 or Global Volume: {name}.{field}={filename} '
+                    f'(searched categories: {categories})')
+    # Optional basis for pruned MiniMax H3, not explicitly named in the workflow.
+    # Never substitute an entire non-pruned checkpoint for this small weight.
+    if h3_pruned:
+        basis_name = 'h3_silu_temb_grid.safetensors'
+        basis_categories = ['h3_adaln']
+        try:
+            basis = catalog.find(basis_name, basis_categories) if catalog else None
+        except Exception:
+            if not R2_FALLBACK:
+                raise
+            basis = None
+        if basis:
+            results[('h3_adaln', basis_name)] = (
+                'h3_adaln', basis_name, basis, None, basis_categories)
+        else:
+            source = legacy._find_source(basis_name, basis_categories)
+            if source:
+                results[('h3_adaln', basis_name)] = (
+                    'h3_adaln', basis_name, None, source[1], basis_categories)
+            else:
+                print('Aivyla R2 WARNING: H3 AdaLN basis unavailable in R2 '
+                      'and Global Volume; pruned H3 may warn', flush=True)
     if len(results) > legacy.MAX_REFERENCES:
         raise RuntimeError('Too many model references')
     return list(results.values())
