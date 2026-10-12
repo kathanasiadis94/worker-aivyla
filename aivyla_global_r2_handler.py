@@ -7,7 +7,13 @@ import runpy
 import sys
 import traceback
 
-import requests
+# Optional for CPU-only CI tests; the runtime image supplies requests.
+try:
+    import requests
+except ModuleNotFoundError as exc:
+    if exc.name != "requests":
+        raise
+    requests = None
 import runpod
 from aivyla_r2_stage import stage_workflow
 
@@ -55,6 +61,9 @@ def _maybe_attach_animated_ltx_preview(payload):
     if not (os.getenv("AIVYLA_ANIMATED_PREVIEW_ENABLED", "false").lower() == "true"
             and os.getenv("AIVYLA_LIVE_PREVIEW_ENABLED", "false").lower() == "true"
             and payload.get("live_preview") is True):
+        return
+    if requests is None:
+        print("Aivyla animated preview: requests unavailable; still preview only", flush=True)
         return
     workflow = payload.get("workflow")
     if not isinstance(workflow, dict):
