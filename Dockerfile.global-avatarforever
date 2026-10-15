@@ -2,10 +2,11 @@
 FROM ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v3
 
 RUN python -m pip install --no-cache-dir 'boto3>=1.34,<2' && python -m pip check
-COPY aivyla_r2_registry.py aivyla_r2_stage.py aivyla_cdn_stage.py aivyla_cdn_v2_stage.py aivyla_r2_nodes.py aivyla_global_r2_handler.py aivyla_global_r2_start.py aivyla_global_nodes.py aivyla_fast_requirements.py aivyla_fast_start.py aivyla_avatarforever.py aivyla_avatarforever_infer.py aivyla_avatarforever_env.py aivyla_avatarforever_smoke.py /opt/aivyla-global/
+COPY aivyla_r2_registry.py aivyla_r2_stage.py aivyla_cdn_stage.py aivyla_cdn_v2_stage.py aivyla_r2_nodes.py aivyla_global_r2_handler.py aivyla_global_r2_start.py aivyla_global_nodes.py aivyla_fast_requirements.py aivyla_fast_start.py aivyla_avatarforever.py aivyla_avatarforever_infer.py aivyla_avatarforever_env.py aivyla_avatarforever_smoke.py aivyla_avatarforever_gemma_check.py /opt/aivyla-global/
 COPY handler.py aivyla_preview.py aivyla_output_upload.py /
 
-# Pin code, install it in a sibling venv, and explicitly expose base CUDA torch.
+# Pin code in an isolated venv; share only the exact CUDA dependency closure.
+# Never expose ComfyUI's site-packages or its diffusers/Transformers metadata.
 # Do not install/upgrade any package in ComfyUI's /opt/venv environment.
 RUN git init /opt/avatarforever/repo \
  && git -C /opt/avatarforever/repo remote add origin https://github.com/leeruibin/avatarforever.git \
@@ -20,10 +21,11 @@ RUN git init /opt/avatarforever/repo \
       --constraint /opt/avatarforever/base-constraints.txt \
       /opt/avatarforever/repo/packages/ltx-core /opt/avatarforever/repo/packages/ltx-pipelines triton \
  && /opt/avatarforever/venv/bin/python -m pip check \
+ && /opt/venv/bin/python -m pip check \
  && /opt/avatarforever/venv/bin/python /opt/aivyla-global/aivyla_avatarforever_smoke.py \
  && /opt/avatarforever/venv/bin/python /opt/avatarforever/repo/inference.py --help \
  && python -m py_compile /opt/aivyla-global/*.py /handler.py /aivyla_preview.py /aivyla_output_upload.py \
- && python -c "import runpy; scope=runpy.run_path('/opt/aivyla-global/aivyla_global_r2_handler.py', run_name='avatarforever_build_smoke'); assert callable(scope['handler']); print('PASS: Global AvatarForever handler import')" \
+ && python -c "import runpy, sys; sys.path.insert(0, '/opt/aivyla-global'); scope=runpy.run_path('/opt/aivyla-global/aivyla_global_r2_handler.py', run_name='avatarforever_build_smoke'); assert callable(scope['handler']); print('PASS: Global AvatarForever handler import')" \
  && command -v ffmpeg && command -v ffprobe
 
 ENV AIVYLA_FAST_REQUIREMENTS=1 \
@@ -35,6 +37,7 @@ ENV AIVYLA_FAST_REQUIREMENTS=1 \
     AIVYLA_R2_PRUNE_UNUSED=1 AIVYLA_R2_SKIP_OBJECT_INFO=1 \
     AIVYLA_LIVE_PREVIEW_ENABLED=false \
     AIVYLA_AVATARFOREVER_ENABLED=1 \
+    AIVYLA_AVATARFOREVER_COMFY_READY_TIMEOUT_SECONDS=180 \
     AIVYLA_AVATARFOREVER_R2_BUCKET=aivyla-models-v2 \
     AIVYLA_AVATARFOREVER_RUNTIME=/opt/avatarforever \
     AIVYLA_AVATARFOREVER_MODEL_ROOT=/tmp/aivyla-avatarforever-models \

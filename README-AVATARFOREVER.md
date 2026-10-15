@@ -15,18 +15,27 @@ are not silently substituted into these experiments.
 
 - Branch: `aivyla-global` only.
 - Dockerfile: `Dockerfile.global-avatarforever`.
-- Workflow: `build-aivyla-global-avatarforever.yml`. Its first push triggers
-  CPU checks and an isolated linux/amd64 image build. Later source-only
-  changes do not trigger builds. No workflow deploys an endpoint.
+- Workflow: `build-aivyla-global-avatarforever.yml`. Pushes changing this
+  workflow or its Dockerfile trigger CPU checks and an isolated linux/amd64
+  image build on `aivyla-global`. Other source-only changes need a manual
+  workflow dispatch. No workflow deploys an endpoint.
 - Image tag: `ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-avatarforever-ci-<run_number>`.
 - Upstream code is pinned to `de4deb6a55c9567a17dad58d67390fe089993630`.
-- The sibling venv reuses the base image's installed CUDA torch through an
-  explicit read-only site-packages bridge. `--system-site-packages` alone
-  cannot expose another venv. Upstream packages are installed into the
-  sibling venv with their full dependency graph, constrained to the existing
-  base package versions. Missing packages such as accelerate are installed
-  into the sibling venv. Its interpreter runs pip check, imports every
-  packaged upstream module and checks real CPU attention and LoRA fusion.
+- The isolated sibling venv shares only the installed distributions needed
+  by `torch`, `torchaudio`, `torchvision`, `triton`, and pip bootstrap.
+  Their dependency closure is derived from the actual base metadata and
+  linked into the target, with exact constraints and bytecode writes disabled.
+  The base site-packages directory and its `.pth` files are never exposed.
+  ComfyUI packages, including its `diffusers`, are absent from the target.
+  Other upstream dependencies are installed with their complete graph there.
+  The Gemma stack is pinned to:
+  `transformers==4.57.6`, `huggingface-hub==0.36.2`, `tokenizers==0.22.2`.
+  These load from the sibling venv; ComfyUI retains its own versions.
+  Missing packages such as accelerate are installed into the sibling venv.
+  Its interpreter runs pip check, imports every packaged upstream module,
+  checks real CPU attention and LoRA fusion, constructs the full 12B Gemma
+  on meta through the actual upstream builder/mutator, and runs the upstream
+  text encoder's forward path using a tiny CPU Gemma instance.
   No image is published unless these exact-container checks pass.
 - Change only the Aivyla Global endpoint's image after a successful build.
   Record the previous image reference for rollback. Keep worker concurrency
@@ -79,6 +88,10 @@ Unsupported keys or partial/zero mapping fail instead of being ignored.
 
 ComfyUI's queue must be idle. Its model cache is unloaded through `/free`
 before starting the isolated GPU process, with a check for released VRAM.
+Both the capabilities check and GPU preflight wait for a valid `/queue`
+response before proceeding. Startup connection failures are retried for up to
+180 seconds (`AIVYLA_AVATARFOREVER_COMFY_READY_TIMEOUT_SECONDS`, at most 600).
+An exited ComfyUI PID fails immediately. A busy queue is never unloaded.
 
 ## Run from the Studio server
 

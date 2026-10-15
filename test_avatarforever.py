@@ -6,12 +6,15 @@ import hashlib
 import importlib.util
 import json
 import io
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 from pathlib import Path
 import runpy
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 import wave
@@ -21,7 +24,7 @@ from unittest import mock
 import aivyla_avatarforever as av
 from aivyla_avatarforever_infer import audit_lora
 from avatarforever_global_test import resolve_endpoint
-from aivyla_avatarforever_env import environment, freeze_base, link_dependencies
+from aivyla_avatarforever_env import TARGET_PACKAGE_PINS, environment, freeze_base, link_dependencies
 
 
 def payload(**extra):
@@ -72,7 +75,8 @@ class EnvironmentBridgeTests(unittest.TestCase):
                 archive.writestr(module+'.py', 'VALUE = '+repr(version)+'\n')
                 archive.writestr(info+'/METADATA', metadata)
                 archive.writestr(info+'/WHEEL', 'Wheel-Version: 1.0\nGenerator: regression-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
-                archive.writestr(info+'/RECORD', '')
+                archive.writestr(info+'/RECORD', ''.join(
+                    entry+',,\n' for entry in (module+'.py', info+'/METADATA', info+'/WHEEL', info+'/RECORD')))
             return path
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -85,27 +89,57 @@ class EnvironmentBridgeTests(unittest.TestCase):
             basewheel = wheel(wheels, 'aivyla-base-lock-fixture', '1.2.3')
             subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(basewheel)],
                            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-            link_dependencies(base/'bin/python', target/'bin/python')
+            old_stack = {'transformers': '5.19.0', 'huggingface-hub': '1.33.0', 'tokenizers': '0.23.2'}
+            for name, old_version in old_stack.items():
+                old = wheel(wheels, name, old_version)
+                subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(old)],
+                               check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                wheel(wheels, name, TARGET_PACKAGE_PINS[name])
+            diffusers = wheel(wheels, 'diffusers', '0.41.0', ['huggingface-hub>=1.32,<2'])
+            subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(diffusers)],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            roots = ('pip', 'aivyla-base-lock-fixture')
+            link_dependencies(base/'bin/python', target/'bin/python', roots=roots)
             constraints = root/'base-constraints.txt'
-            pins = freeze_base(base/'bin/python', constraints)
+            pins = freeze_base(base/'bin/python', constraints, roots=roots)
             self.assertEqual(pins['aivyla-base-lock-fixture'], '1.2.3')
+            for name, version in TARGET_PACKAGE_PINS.items():
+                self.assertEqual(pins[name], version)
             missing = wheel(wheels, 'aivyla-missing-dep-fixture', '4.5.6')
             consumer = wheel(wheels, 'aivyla-consumer-fixture', '1.0',
-                             ['aivyla-base-lock-fixture>=1', 'aivyla-missing-dep-fixture>=4'])
+                             ['aivyla-base-lock-fixture>=1', 'aivyla-missing-dep-fixture>=4',
+                              *(f'{name}=={version}' for name, version in TARGET_PACKAGE_PINS.items())])
             install = [str(target/'bin/python'), '-m', 'pip', 'install', '--no-index',
                        '--find-links', str(wheels), '--constraint', str(constraints)]
             subprocess.run([*install, str(consumer)], check=True, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, timeout=60)
-            probe = ('from importlib.metadata import version; import aivyla_base_lock_fixture as b; '
+            probe = ('from importlib.metadata import version; from pathlib import Path; import aivyla_base_lock_fixture as b; '
                      'import aivyla_missing_dep_fixture as m; '
                      'print(version("aivyla-base-lock-fixture"), version("aivyla-missing-dep-fixture")); '
-                     'print(b.__file__); print(m.__file__)')
+                     'print(Path(b.__file__).resolve()); print(m.__file__)')
             result = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe], text=True)
             self.assertEqual(result.splitlines()[0], '1.2.3 4.5.6')
             self.assertTrue(result.splitlines()[1].startswith(str(base)))
             self.assertTrue(result.splitlines()[2].startswith(str(target)))
             checked = subprocess.check_output([str(target/'bin/python'), '-m', 'pip', 'check'], text=True)
             self.assertIn('No broken requirements found', checked)
+            absent = subprocess.check_output([str(target/'bin/python'), '-I', '-c',
+                'import importlib.util; from importlib.metadata import distributions; '
+                'assert importlib.util.find_spec("diffusers") is None; '
+                'assert "diffusers" not in {d.metadata["Name"] for d in distributions()}; print("isolated")'], text=True)
+            self.assertEqual(absent.strip(), 'isolated')
+            self.assertNotIn('diffusers', pins)
+            base_checked = subprocess.check_output([str(base/'bin/python'), '-m', 'pip', 'check'], text=True)
+            self.assertIn('No broken requirements found', base_checked)
+            for name, version in TARGET_PACKAGE_PINS.items():
+                probe_stack = ('from importlib.metadata import version; import '
+                               + name.replace('-', '_') + ' as m; print(version('
+                               + repr(name) + ')); print(m.__file__)')
+                result_stack = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe_stack], text=True)
+                self.assertEqual(result_stack.splitlines()[0], version)
+                self.assertTrue(result_stack.splitlines()[1].startswith(str(target)))
+                base_stack = subprocess.check_output([str(base/'bin/python'), '-I', '-c', probe_stack], text=True)
+                self.assertEqual(base_stack.splitlines()[0], old_stack[name])
             # A conflicting upgrade must fail, rather than replace a CUDA/base package.
             wheel(wheels, 'aivyla-base-lock-fixture', '9.0')
             conflict = wheel(wheels, 'aivyla-conflict-fixture', '1.0', ['aivyla-base-lock-fixture>=9'])
@@ -124,14 +158,16 @@ class EnvironmentBridgeTests(unittest.TestCase):
             subprocess.run([sys.executable, '-m', 'venv', str(base)],
                            check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             subprocess.run([str(base/'bin/python'), '-m', 'venv', '--without-pip',
-                            '--system-site-packages', str(target)], check=True, timeout=60)
+                            str(target)], check=True, timeout=60)
             source = Path(environment(base/'bin/python')['purelib'])
             package = source / 'aivyla_base_fixture.py'
             package.write_text('VALUE = 173\n')
             metadata = source / 'aivyla_base_fixture-1.2.3.dist-info'
             metadata.mkdir()
             (metadata/'METADATA').write_text('Metadata-Version: 2.1\nName: aivyla-base-fixture\nVersion: 1.2.3\n')
+            (metadata/'RECORD').write_text('aivyla_base_fixture.py,,\naivyla_base_fixture-1.2.3.dist-info/METADATA,,\naivyla_base_fixture-1.2.3.dist-info/RECORD,,\n')
             target_site = Path(environment(target/'bin/python')['purelib'])
+            (target_site/'__pycache__').mkdir(exist_ok=True)
             dependent = target_site/'aivyla_target_fixture-1.0.dist-info'
             dependent.mkdir()
             (dependent/'METADATA').write_text('Metadata-Version: 2.1\nName: aivyla-target-fixture\n'
@@ -143,13 +179,18 @@ class EnvironmentBridgeTests(unittest.TestCase):
             missing = subprocess.run([str(target/'bin/python'), '-I', '-c', probe],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertNotEqual(missing.returncode, 0, 'Regression fixture must reproduce missing sibling deps')
-            result = link_dependencies(base/'bin/python', target/'bin/python')
+            roots = ('pip', 'aivyla-base-fixture')
+            result = link_dependencies(base/'bin/python', target/'bin/python', roots=roots)
+            self.assertFalse((target_site/'__pycache__').is_symlink())
             output = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe], text=True)
             self.assertEqual(output.strip(), '173 1.2.3')
             checked = subprocess.check_output([str(target/'bin/python'), '-I', '-m', 'pip', 'check'], text=True)
             self.assertIn('No broken requirements found', checked)
-            link_dependencies(base/'bin/python', target/'bin/python')
-            self.assertEqual(Path(result['bridge']).read_text().count('addsitedir'), 1)
+            link_dependencies(base/'bin/python', target/'bin/python', roots=roots)
+            self.assertEqual(set(result['shared_packages']), {'pip', 'aivyla-base-fixture'})
+            visible = json.loads(subprocess.check_output([str(target/'bin/python'), '-I', '-c',
+                                 'import json,sys; print(json.dumps(sys.path))'], text=True))
+            self.assertNotIn(str(source), visible)
             # Imports can create bytecode; all original base files remain byte-identical.
             for name, data in before.items():
                 self.assertEqual((base/name).read_bytes(), data, name)
@@ -345,7 +386,146 @@ class LoraAuditTests(unittest.TestCase):
                 audit_lora({'x.weight': (8, 16)}, tensors)
 
 
+class ComfyReadinessTests(unittest.TestCase):
+    def test_real_http_cold_start_waits_until_queue_api_is_available(self):
+        # Reserve a real localhost port, but listen only after the first actual
+        # connection refusal: reproduces the ordering in the worker's logs.
+        class QueueHandler(BaseHTTPRequestHandler):
+            paths = []
+            def do_GET(self):
+                self.paths.append(self.path)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"queue_running": [], "queue_pending": []}')
+            def log_message(self, *args):
+                pass
+        server = HTTPServer(('127.0.0.1', 0), QueueHandler, bind_and_activate=False)
+        server.server_bind()
+        address = 'http://127.0.0.1:' + str(server.server_address[1])
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        from urllib.request import urlopen
+        from urllib.error import URLError
+        attempts = []
+        def probe(*args, **kwargs):
+            try:
+                response = urlopen(*args, **kwargs)
+                attempts.append('ready')
+                return response
+            except URLError:
+                attempts.append('refused')
+                server.server_activate()
+                thread.start()
+                raise
+        try:
+            with mock.patch.object(av, 'COMFY_API', address), \
+                    mock.patch.object(av, 'comfy_process_alive', return_value=True), \
+                    mock.patch('urllib.request.urlopen', side_effect=probe):
+                queue = av.wait_for_comfy_queue(timeout_seconds=2, poll_seconds=.01)
+            self.assertEqual(attempts, ['refused', 'ready'])
+            self.assertEqual(queue, {'queue_running': [], 'queue_pending': []})
+            self.assertEqual(QueueHandler.paths, ['/queue'])
+        finally:
+            if thread.is_alive():
+                server.shutdown()
+                thread.join(timeout=2)
+            server.server_close()
+
+    def test_dead_comfy_process_fails_without_waiting_or_http(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory)/'comfy.pid'
+            child = subprocess.Popen([sys.executable, '-c', 'pass'])
+            child.wait(timeout=5)
+            pidfile.write_text(str(child.pid))
+            with mock.patch.object(av, 'COMFY_PID_FILE', pidfile), \
+                    mock.patch('urllib.request.urlopen') as request:
+                with self.assertRaisesRegex(RuntimeError, 'process exited'):
+                    av.wait_for_comfy_queue(timeout_seconds=2)
+                request.assert_not_called()
+
+    def test_unavailable_api_has_bounded_wait_when_pid_is_missing(self):
+        from urllib.error import URLError
+        with mock.patch.object(av, 'comfy_process_alive', return_value=None), \
+                mock.patch('urllib.request.urlopen', side_effect=URLError('connection refused')):
+            started = time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, 'did not become ready'):
+                av.wait_for_comfy_queue(timeout_seconds=.05, poll_seconds=.01)
+            self.assertLess(time.monotonic() - started, 1)
+
+    def test_busy_comfy_queue_is_never_unloaded(self):
+        requests = types.ModuleType('requests')
+        requests.post = mock.Mock()
+        with mock.patch.dict(sys.modules, {'requests': requests}), \
+                mock.patch.object(av, 'wait_for_comfy_queue', return_value={
+                    'queue_running': [['running-job']], 'queue_pending': []}):
+            with self.assertRaisesRegex(RuntimeError, 'active/queued work'):
+                av.free_comfy_gpu()
+            requests.post.assert_not_called()
+
+    def test_invalid_queue_is_rejected_before_unloading(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(b'{}')
+        with mock.patch.object(av, 'comfy_process_alive', return_value=True), \
+                mock.patch('urllib.request.urlopen', return_value=response):
+            with self.assertRaisesRegex(RuntimeError, 'invalid response'):
+                av.wait_for_comfy_queue(timeout_seconds=2)
+
+
 class JobTests(unittest.TestCase):
+    def test_runtime_preflight_rejects_image_without_gemma_construction_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root/'venv/bin/python'
+            python.parent.mkdir(parents=True)
+            python.touch()
+            (root/'repo').mkdir()
+            (root/'repo/inference.py').touch()
+            (root/'revision.txt').write_text(av.UPSTREAM_REVISION)
+            with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_RUNTIME': directory}), \
+                    mock.patch.object(av.shutil, 'which', return_value='/bin/fixture'):
+                (root/'runtime-check.json').write_text('{"imported_modules":104}')
+                with self.assertRaisesRegex(RuntimeError, 'Gemma construction check'):
+                    av.runtime_preflight()
+                (root/'runtime-check.json').write_text(json.dumps({'gemma': {
+                    'packages': TARGET_PACKAGE_PINS, 'full_model_buffer_population': 'passed',
+                    'text_encode_cpu': 'passed'}}))
+                self.assertEqual(av.runtime_preflight(), (python, root/'repo'))
+
+    def test_build_import_from_unrelated_directory_uses_real_sibling_modules(self):
+        # Build uses python -c + runpy from /, whereas runtime executes the
+        # wrapper file directly. Only the latter adds its parent to sys.path.
+        root = Path(__file__).resolve().parent
+        preamble = '''import runpy, sys, types
+sys.modules['runpod'] = types.ModuleType('runpod')
+def validate_workflow_models(workflow):
+    return None
+def handler(job):
+    return {}
+original_run_path = runpy.run_path
+def intercepted(path, **kwargs):
+    if path == '/handler.py':
+        return {'handler': handler}
+    return original_run_path(path, **kwargs)
+runpy.run_path = intercepted
+'''
+        command = ("scope=runpy.run_path(" + repr(str(root/'aivyla_global_r2_handler.py'))
+                   + ", run_name='avatarforever_build_smoke'); "
+                   + "assert callable(scope['handler']); print('PASS')")
+        env = dict(os.environ)
+        env.pop('PYTHONPATH', None)
+        with tempfile.TemporaryDirectory() as directory:
+            old = subprocess.run([sys.executable, '-c', preamble+command], cwd=directory,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertNotEqual(old.returncode, 0)
+            self.assertIn("No module named 'aivyla_r2_stage'", old.stderr)
+            fixed = preamble + 'sys.path.insert(0, ' + repr(str(root)) + ')\n' + command
+            new = subprocess.run([sys.executable, '-c', fixed], cwd=directory,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(new.returncode, 0, new.stderr)
+            self.assertEqual(new.stdout.strip(), 'PASS')
+        docker = (root/'Dockerfile.global-avatarforever').read_text()
+        self.assertIn("sys.path.insert(0, '/opt/aivyla-global'); scope=runpy.run_path", docker)
+
     def fake_comparison(self, fail_on=None):
         with tempfile.TemporaryDirectory() as directory:
             transport = types.ModuleType('aivyla_output_upload')
@@ -406,10 +586,13 @@ class JobTests(unittest.TestCase):
     def test_capabilities_does_not_stage_or_generate(self):
         with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_ENABLED': '1'}), \
                 mock.patch.object(av, 'runtime_preflight'), \
+                mock.patch.object(av, 'wait_for_comfy_queue') as ready, \
                 mock.patch.object(av, 'BundleStager') as staging:
             result = av.run_comparison({'id': 'job'}, {'action': 'capabilities'})
             self.assertEqual(result['bucket'], 'aivyla-models-v2')
             self.assertFalse(result['generation_started'])
+            self.assertTrue(result['comfy_api_ready'])
+            ready.assert_called_once_with()
             staging.assert_not_called()
 
     def test_concurrent_comparison_refused(self):
