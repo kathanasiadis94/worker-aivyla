@@ -20,6 +20,7 @@ from unittest import mock
 import aivyla_avatarforever as av
 from aivyla_avatarforever_infer import audit_lora
 from avatarforever_global_test import resolve_endpoint
+from aivyla_avatarforever_env import environment, link_dependencies
 
 
 def payload(**extra):
@@ -54,6 +55,56 @@ class FakeS3:
         self.downloads.append(key)
         data = self.objects[key]
         Path(filename).write_bytes(b'!' * len(data) if self.corrupt else data)
+
+
+class EnvironmentBridgeTests(unittest.TestCase):
+    def test_real_sibling_venvs_preserve_base_and_share_dependencies(self):
+        # This reproduces the failed image build without requiring CUDA/Docker.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base, target = root/'base', root/'target'
+            subprocess.run([sys.executable, '-m', 'venv', str(base)],
+                           check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run([str(base/'bin/python'), '-m', 'venv', '--without-pip',
+                            '--system-site-packages', str(target)], check=True, timeout=60)
+            source = Path(environment(base/'bin/python')['purelib'])
+            package = source / 'aivyla_base_fixture.py'
+            package.write_text('VALUE = 173\n')
+            metadata = source / 'aivyla_base_fixture-1.2.3.dist-info'
+            metadata.mkdir()
+            (metadata/'METADATA').write_text('Metadata-Version: 2.1\nName: aivyla-base-fixture\nVersion: 1.2.3\n')
+            target_site = Path(environment(target/'bin/python')['purelib'])
+            dependent = target_site/'aivyla_target_fixture-1.0.dist-info'
+            dependent.mkdir()
+            (dependent/'METADATA').write_text('Metadata-Version: 2.1\nName: aivyla-target-fixture\n'
+                                             'Version: 1.0\nRequires-Dist: aivyla-base-fixture>=1\n')
+            before = {p.relative_to(base).as_posix(): p.read_bytes()
+                      for p in base.rglob('*') if p.is_file() and not p.is_symlink()}
+            probe = ('import aivyla_base_fixture; from importlib.metadata import version; '
+                     'print(aivyla_base_fixture.VALUE, version("aivyla-base-fixture"))')
+            missing = subprocess.run([str(target/'bin/python'), '-I', '-c', probe],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(missing.returncode, 0, 'Regression fixture must reproduce missing sibling deps')
+            result = link_dependencies(base/'bin/python', target/'bin/python')
+            output = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe], text=True)
+            self.assertEqual(output.strip(), '173 1.2.3')
+            checked = subprocess.check_output([str(target/'bin/python'), '-I', '-m', 'pip', 'check'], text=True)
+            self.assertIn('No broken requirements found', checked)
+            link_dependencies(base/'bin/python', target/'bin/python')
+            self.assertEqual(Path(result['bridge']).read_text().count('addsitedir'), 1)
+            # Imports can create bytecode; all original base files remain byte-identical.
+            for name, data in before.items():
+                self.assertEqual((base/name).read_bytes(), data, name)
+
+    def test_refuse_base_environment_as_target(self):
+        with self.assertRaisesRegex(ValueError, 'Refuse to modify'):
+            link_dependencies(sys.executable, sys.executable)
+
+    def test_refuse_cross_minor_version(self):
+        with mock.patch('aivyla_avatarforever_env.environment',
+                        side_effect=[dict(version=[3, 11]), dict(version=[3, 12])]):
+            with self.assertRaisesRegex(ValueError, 'versions must match'):
+                link_dependencies('base', 'target')
 
 
 class PayloadTests(unittest.TestCase):

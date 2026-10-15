@@ -20,15 +20,18 @@ are not silently substituted into these experiments.
   changes do not trigger builds. No workflow deploys an endpoint.
 - Image tag: `ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-avatarforever-ci-<run_number>`.
 - Upstream code is pinned to `de4deb6a55c9567a17dad58d67390fe089993630`.
-- The isolated venv reuses the base image's installed CUDA torch through
-  system-site-packages; upstream packages are installed into that venv.
-  CPU runtime imports and dependency checks run during the Docker build.
+- The sibling venv reuses the base image's installed CUDA torch through an
+  explicit read-only site-packages bridge. `--system-site-packages` alone
+  cannot expose another venv. Upstream packages are installed into the
+  sibling venv; its interpreter runs pip check and import smoke tests.
 - Change only the Aivyla Global endpoint's image after a successful build.
   Record the previous image reference for rollback. Keep worker concurrency
   at 1 and configure the endpoint execution timeout to allow the comparison
   plus the initial model download (the comparison budget is 3300 seconds).
 - The GPU preflight requires one visible GPU with at least 70000 MiB free.
   This is a conservative pilot gate, not a measured minimum VRAM claim.
+  The selected test hardware is RTX PRO 6000 Blackwell 96 GB, one GPU.
+  `AIVYLA_DYNAMIC_VRAM=0` remains explicit in this image.
 
 Existing Global bootstrap, ComfyUI graphs and Studio services remain in use.
 The production handler, image tags, endpoint and app routing are not edited.
