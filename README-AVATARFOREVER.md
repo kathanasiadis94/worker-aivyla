@@ -23,7 +23,11 @@ are not silently substituted into these experiments.
 - The sibling venv reuses the base image's installed CUDA torch through an
   explicit read-only site-packages bridge. `--system-site-packages` alone
   cannot expose another venv. Upstream packages are installed into the
-  sibling venv; its interpreter runs pip check and import smoke tests.
+  sibling venv with their full dependency graph, constrained to the existing
+  base package versions. Missing packages such as accelerate are installed
+  into the sibling venv. Its interpreter runs pip check, imports every
+  packaged upstream module and checks real CPU attention and LoRA fusion.
+  No image is published unless these exact-container checks pass.
 - Change only the Aivyla Global endpoint's image after a successful build.
   Record the previous image reference for rollback. Keep worker concurrency
   at 1 and configure the endpoint execution timeout to allow the comparison

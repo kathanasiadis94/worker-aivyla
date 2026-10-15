@@ -15,12 +15,13 @@ import tempfile
 import types
 import unittest
 import wave
+import zipfile
 from unittest import mock
 
 import aivyla_avatarforever as av
 from aivyla_avatarforever_infer import audit_lora
 from avatarforever_global_test import resolve_endpoint
-from aivyla_avatarforever_env import environment, link_dependencies
+from aivyla_avatarforever_env import environment, freeze_base, link_dependencies
 
 
 def payload(**extra):
@@ -58,6 +59,63 @@ class FakeS3:
 
 
 class EnvironmentBridgeTests(unittest.TestCase):
+    def test_real_resolver_installs_missing_dependencies_and_preserves_base(self):
+        # Fully offline wheelhouse: exercises the actual pip install command,
+        # dependency resolution and constraints, rather than mocking a package.
+        def wheel(directory, name, version, requires=()):
+            module = name.replace('-', '_')
+            info = f'{module}-{version}.dist-info'
+            path = directory/f'{module}-{version}-py3-none-any.whl'
+            metadata = f'Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n'
+            metadata += ''.join(f'Requires-Dist: {requirement}\n' for requirement in requires)
+            with zipfile.ZipFile(path, 'w') as archive:
+                archive.writestr(module+'.py', 'VALUE = '+repr(version)+'\n')
+                archive.writestr(info+'/METADATA', metadata)
+                archive.writestr(info+'/WHEEL', 'Wheel-Version: 1.0\nGenerator: regression-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+                archive.writestr(info+'/RECORD', '')
+            return path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base, target, wheels = root/'base', root/'target', root/'wheels'
+            wheels.mkdir()
+            subprocess.run([sys.executable, '-m', 'venv', str(base)], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            subprocess.run([str(base/'bin/python'), '-m', 'venv', '--without-pip', str(target)],
+                           check=True, timeout=60)
+            basewheel = wheel(wheels, 'aivyla-base-lock-fixture', '1.2.3')
+            subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(basewheel)],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            link_dependencies(base/'bin/python', target/'bin/python')
+            constraints = root/'base-constraints.txt'
+            pins = freeze_base(base/'bin/python', constraints)
+            self.assertEqual(pins['aivyla-base-lock-fixture'], '1.2.3')
+            missing = wheel(wheels, 'aivyla-missing-dep-fixture', '4.5.6')
+            consumer = wheel(wheels, 'aivyla-consumer-fixture', '1.0',
+                             ['aivyla-base-lock-fixture>=1', 'aivyla-missing-dep-fixture>=4'])
+            install = [str(target/'bin/python'), '-m', 'pip', 'install', '--no-index',
+                       '--find-links', str(wheels), '--constraint', str(constraints)]
+            subprocess.run([*install, str(consumer)], check=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=60)
+            probe = ('from importlib.metadata import version; import aivyla_base_lock_fixture as b; '
+                     'import aivyla_missing_dep_fixture as m; '
+                     'print(version("aivyla-base-lock-fixture"), version("aivyla-missing-dep-fixture")); '
+                     'print(b.__file__); print(m.__file__)')
+            result = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe], text=True)
+            self.assertEqual(result.splitlines()[0], '1.2.3 4.5.6')
+            self.assertTrue(result.splitlines()[1].startswith(str(base)))
+            self.assertTrue(result.splitlines()[2].startswith(str(target)))
+            checked = subprocess.check_output([str(target/'bin/python'), '-m', 'pip', 'check'], text=True)
+            self.assertIn('No broken requirements found', checked)
+            # A conflicting upgrade must fail, rather than replace a CUDA/base package.
+            wheel(wheels, 'aivyla-base-lock-fixture', '9.0')
+            conflict = wheel(wheels, 'aivyla-conflict-fixture', '1.0', ['aivyla-base-lock-fixture>=9'])
+            refused = subprocess.run([*install, str(conflict)], stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=60)
+            self.assertNotEqual(refused.returncode, 0)
+            unchanged = subprocess.check_output([str(base/'bin/python'), '-I', '-c',
+                       'from importlib.metadata import version; print(version("aivyla-base-lock-fixture"))'], text=True)
+            self.assertEqual(unchanged.strip(), '1.2.3')
+
     def test_real_sibling_venvs_preserve_base_and_share_dependencies(self):
         # This reproduces the failed image build without requiring CUDA/Docker.
         with tempfile.TemporaryDirectory() as directory:
@@ -105,6 +163,15 @@ class EnvironmentBridgeTests(unittest.TestCase):
                         side_effect=[dict(version=[3, 11]), dict(version=[3, 12])]):
             with self.assertRaisesRegex(ValueError, 'versions must match'):
                 link_dependencies('base', 'target')
+
+    def test_docker_installs_complete_dependencies_before_runtime_checks(self):
+        docker = Path(__file__).with_name('Dockerfile.global-avatarforever').read_text()
+        self.assertNotIn('--no-deps', docker)
+        self.assertIn('--constraint /opt/avatarforever/base-constraints.txt', docker)
+        self.assertLess(docker.index('--constraints /opt/avatarforever/base-constraints.txt'),
+                        docker.index('-m pip install --no-cache-dir', docker.index('uv venv')))
+        self.assertLess(docker.index('-m pip check', docker.index('uv venv')),
+                        docker.index('python /opt/aivyla-global/aivyla_avatarforever_smoke.py'))
 
 
 class PayloadTests(unittest.TestCase):

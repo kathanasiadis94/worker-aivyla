@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 
 PROBE = (
@@ -48,12 +49,44 @@ def link_dependencies(base_python, target_python):
     return {'base_sites': base_sites, 'target_site': str(target_site), 'bridge': str(bridge)}
 
 
+def freeze_base(base_python, destination):
+    """Constrain all inherited versions while allowing missing deps to install."""
+    probe = (
+        "import json; from importlib.metadata import distributions; "
+        "print(json.dumps([(d.metadata['Name'], d.version) for d in distributions()]))"
+    )
+    installed = json.loads(subprocess.check_output([str(base_python), '-I', '-c', probe],
+                                                   text=True, timeout=30))
+    versions = {}
+    for name, version in installed:
+        canonical = re.sub(r'[-_.]+', '-', name).lower()
+        if canonical in ('ltx-core', 'ltx-pipelines'):
+            continue  # These two packages come from the pinned upstream source.
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', canonical) or not re.fullmatch(r'[A-Za-z0-9.!+_-]+', version):
+            raise ValueError(f'Invalid installed package name/version: {name}')
+        if canonical in versions and versions[canonical] != version:
+            raise ValueError(f'Conflicting base versions for {canonical}')
+        versions[canonical] = version
+    if not versions:
+        raise ValueError('The base environment has no installed package metadata')
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(''.join(f'{name}=={version}\n' for name, version in sorted(versions.items())))
+    return versions
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-python', type=Path, required=True)
     parser.add_argument('--target-python', type=Path, required=True)
+    parser.add_argument('--constraints', type=Path)
     args = parser.parse_args()
-    print(json.dumps(link_dependencies(args.base_python, args.target_python), indent=2))
+    report = link_dependencies(args.base_python, args.target_python)
+    if args.constraints:
+        versions = freeze_base(args.base_python, args.constraints)
+        report['constrained_packages'] = len(versions)
+        report['constraints'] = str(args.constraints)
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == '__main__':
