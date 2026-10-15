@@ -60,3 +60,4 @@ jobs:
           echo 'IMAGE=ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-avatarforever-ci-${{ github.run_number }}'
           echo 'DIGEST=${{ steps.build.outputs.digest }}'
           echo 'Deploy only to Aivyla Global, then run avatarforever_global_test.py --check.'
+          
