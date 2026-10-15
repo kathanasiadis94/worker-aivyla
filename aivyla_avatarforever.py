@@ -240,6 +240,7 @@ class BundleStager:
 
 
 def runtime_preflight():
+    from aivyla_avatarforever_env import TARGET_PACKAGE_PINS
     root = Path(os.getenv('AIVYLA_AVATARFOREVER_RUNTIME', '/opt/avatarforever'))
     python = root / 'venv/bin/python'
     repo = root / 'repo'
@@ -248,6 +249,14 @@ def runtime_preflight():
             raise RuntimeError('AvatarForever runtime is missing; deploy the AvatarForever Global image first')
     if (root / 'revision.txt').read_text().strip() != UPSTREAM_REVISION:
         raise RuntimeError('AvatarForever runtime revision mismatch')
+    try:
+        gemma_check = json.loads((root / 'runtime-check.json').read_text())['gemma']
+    except (FileNotFoundError, KeyError, ValueError, TypeError) as exc:
+        raise RuntimeError('Deploy the AvatarForever image with the Gemma construction check') from exc
+    if (gemma_check.get('packages') != TARGET_PACKAGE_PINS or
+            gemma_check.get('full_model_buffer_population') != 'passed' or
+            gemma_check.get('text_encode_cpu') != 'passed'):
+        raise RuntimeError('AvatarForever Gemma runtime validation is missing or incompatible')
     for command in ('ffmpeg', 'ffprobe', 'nvidia-smi'):
         if not shutil.which(command):
             raise RuntimeError(f'AvatarForever runtime missing {command}')

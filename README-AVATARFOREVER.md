@@ -24,10 +24,15 @@ are not silently substituted into these experiments.
 - The sibling venv reuses the base image's installed CUDA torch through an
   explicit read-only site-packages bridge. `--system-site-packages` alone
   cannot expose another venv. Upstream packages are installed into the
-  sibling venv with their full dependency graph, constrained to the existing
-  base package versions. Missing packages such as accelerate are installed
-  into the sibling venv. Its interpreter runs pip check, imports every
-  packaged upstream module and checks real CPU attention and LoRA fusion.
+  sibling venv with their full dependency graph. Inherited package versions
+  remain constrained except for the explicitly isolated Gemma stack:
+  `transformers==4.57.6`, `huggingface-hub==0.36.2`, `tokenizers==0.22.2`.
+  These load from the sibling venv; ComfyUI retains its own versions.
+  Missing packages such as accelerate are installed into the sibling venv.
+  Its interpreter runs pip check, imports every packaged upstream module,
+  checks real CPU attention and LoRA fusion, constructs the full 12B Gemma
+  on meta through the actual upstream builder/mutator, and runs the upstream
+  text encoder's forward path using a tiny CPU Gemma instance.
   No image is published unless these exact-container checks pass.
 - Change only the Aivyla Global endpoint's image after a successful build.
   Record the previous image reference for rollback. Keep worker concurrency

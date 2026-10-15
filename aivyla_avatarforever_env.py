@@ -18,6 +18,14 @@ PROBE = (
     "purelib=sysconfig.get_path('purelib'),platlib=sysconfig.get_path('platlib'))))"
 )
 
+# AvatarForever's Gemma loader uses the Transformers 4.x module/state-dict
+# layout. Install this stack only in the sibling venv; ComfyUI retains 5.x.
+TARGET_PACKAGE_PINS = {
+    'transformers': '4.57.6',
+    'huggingface-hub': '0.36.2',
+    'tokenizers': '0.22.2',
+}
+
 
 def environment(python):
     return json.loads(subprocess.check_output([str(python), '-I', '-c', PROBE],
@@ -50,7 +58,7 @@ def link_dependencies(base_python, target_python):
 
 
 def freeze_base(base_python, destination):
-    """Constrain all inherited versions while allowing missing deps to install."""
+    """Freeze inherited deps except the explicitly isolated Gemma package stack."""
     probe = (
         "import json; from importlib.metadata import distributions; "
         "print(json.dumps([(d.metadata['Name'], d.version) for d in distributions()]))"
@@ -60,8 +68,8 @@ def freeze_base(base_python, destination):
     versions = {}
     for name, version in installed:
         canonical = re.sub(r'[-_.]+', '-', name).lower()
-        if canonical in ('ltx-core', 'ltx-pipelines'):
-            continue  # These two packages come from the pinned upstream source.
+        if canonical in ('ltx-core', 'ltx-pipelines') or canonical in TARGET_PACKAGE_PINS:
+            continue  # Local upstream source and target-only Gemma overrides.
         if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', canonical) or not re.fullmatch(r'[A-Za-z0-9.!+_-]+', version):
             raise ValueError(f'Invalid installed package name/version: {name}')
         if canonical in versions and versions[canonical] != version:
@@ -69,6 +77,7 @@ def freeze_base(base_python, destination):
         versions[canonical] = version
     if not versions:
         raise ValueError('The base environment has no installed package metadata')
+    versions.update(TARGET_PACKAGE_PINS)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(''.join(f'{name}=={version}\n' for name, version in sorted(versions.items())))

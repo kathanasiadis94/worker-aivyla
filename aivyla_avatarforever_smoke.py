@@ -14,6 +14,7 @@ def main():
     import ltx_core
     import ltx_pipelines
     import accelerate
+    from aivyla_avatarforever_gemma_check import check_gemma_runtime
     from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP
     from ltx_core.loader.fuse_loras import apply_loras
     from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
@@ -43,9 +44,11 @@ def main():
         raise RuntimeError('LoRA mapping smoke test failed')
     if not callable(ltx_pipelines.ARA2VidDistilledPipeline):
         raise RuntimeError('AvatarForever pipeline is unavailable')
+    gemma_check = check_gemma_runtime()
     report = dict(python=sys.version, torch=torch.__version__, cuda=torch.version.cuda,
                   torch_path=torch.__file__, accelerate=accelerate.__version__,
-                  imported_modules=len(imported), attention_cpu='passed', lora_fusion_cpu='passed')
+                  imported_modules=len(imported), attention_cpu='passed', lora_fusion_cpu='passed',
+                  gemma=gemma_check)
     Path('/opt/avatarforever/runtime-check.json').write_text(json.dumps(report, indent=2))
     pinned = sorted({d.metadata['Name'] + '==' + d.version for d in distributions()})
     Path('/opt/avatarforever/resolved-requirements.txt').write_text('\n'.join(pinned) + '\n')

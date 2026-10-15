@@ -24,7 +24,7 @@ from unittest import mock
 import aivyla_avatarforever as av
 from aivyla_avatarforever_infer import audit_lora
 from avatarforever_global_test import resolve_endpoint
-from aivyla_avatarforever_env import environment, freeze_base, link_dependencies
+from aivyla_avatarforever_env import TARGET_PACKAGE_PINS, environment, freeze_base, link_dependencies
 
 
 def payload(**extra):
@@ -88,13 +88,22 @@ class EnvironmentBridgeTests(unittest.TestCase):
             basewheel = wheel(wheels, 'aivyla-base-lock-fixture', '1.2.3')
             subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(basewheel)],
                            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            old_stack = {'transformers': '5.19.0', 'huggingface-hub': '1.33.0', 'tokenizers': '0.23.2'}
+            for name, old_version in old_stack.items():
+                old = wheel(wheels, name, old_version)
+                subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(old)],
+                               check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                wheel(wheels, name, TARGET_PACKAGE_PINS[name])
             link_dependencies(base/'bin/python', target/'bin/python')
             constraints = root/'base-constraints.txt'
             pins = freeze_base(base/'bin/python', constraints)
             self.assertEqual(pins['aivyla-base-lock-fixture'], '1.2.3')
+            for name, version in TARGET_PACKAGE_PINS.items():
+                self.assertEqual(pins[name], version)
             missing = wheel(wheels, 'aivyla-missing-dep-fixture', '4.5.6')
             consumer = wheel(wheels, 'aivyla-consumer-fixture', '1.0',
-                             ['aivyla-base-lock-fixture>=1', 'aivyla-missing-dep-fixture>=4'])
+                             ['aivyla-base-lock-fixture>=1', 'aivyla-missing-dep-fixture>=4',
+                              *(f'{name}=={version}' for name, version in TARGET_PACKAGE_PINS.items())])
             install = [str(target/'bin/python'), '-m', 'pip', 'install', '--no-index',
                        '--find-links', str(wheels), '--constraint', str(constraints)]
             subprocess.run([*install, str(consumer)], check=True, stdout=subprocess.PIPE,
@@ -109,6 +118,15 @@ class EnvironmentBridgeTests(unittest.TestCase):
             self.assertTrue(result.splitlines()[2].startswith(str(target)))
             checked = subprocess.check_output([str(target/'bin/python'), '-m', 'pip', 'check'], text=True)
             self.assertIn('No broken requirements found', checked)
+            for name, version in TARGET_PACKAGE_PINS.items():
+                probe_stack = ('from importlib.metadata import version; import '
+                               + name.replace('-', '_') + ' as m; print(version('
+                               + repr(name) + ')); print(m.__file__)')
+                result_stack = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe_stack], text=True)
+                self.assertEqual(result_stack.splitlines()[0], version)
+                self.assertTrue(result_stack.splitlines()[1].startswith(str(target)))
+                base_stack = subprocess.check_output([str(base/'bin/python'), '-I', '-c', probe_stack], text=True)
+                self.assertEqual(base_stack.splitlines()[0], old_stack[name])
             # A conflicting upgrade must fail, rather than replace a CUDA/base package.
             wheel(wheels, 'aivyla-base-lock-fixture', '9.0')
             conflict = wheel(wheels, 'aivyla-conflict-fixture', '1.0', ['aivyla-base-lock-fixture>=9'])
@@ -434,6 +452,25 @@ class ComfyReadinessTests(unittest.TestCase):
 
 
 class JobTests(unittest.TestCase):
+    def test_runtime_preflight_rejects_image_without_gemma_construction_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root/'venv/bin/python'
+            python.parent.mkdir(parents=True)
+            python.touch()
+            (root/'repo').mkdir()
+            (root/'repo/inference.py').touch()
+            (root/'revision.txt').write_text(av.UPSTREAM_REVISION)
+            with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_RUNTIME': directory}), \
+                    mock.patch.object(av.shutil, 'which', return_value='/bin/fixture'):
+                (root/'runtime-check.json').write_text('{"imported_modules":104}')
+                with self.assertRaisesRegex(RuntimeError, 'Gemma construction check'):
+                    av.runtime_preflight()
+                (root/'runtime-check.json').write_text(json.dumps({'gemma': {
+                    'packages': TARGET_PACKAGE_PINS, 'full_model_buffer_population': 'passed',
+                    'text_encode_cpu': 'passed'}}))
+                self.assertEqual(av.runtime_preflight(), (python, root/'repo'))
+
     def test_build_import_from_unrelated_directory_uses_real_sibling_modules(self):
         # Build uses python -c + runpy from /, whereas runtime executes the
         # wrapper file directly. Only the latter adds its parent to sys.path.
