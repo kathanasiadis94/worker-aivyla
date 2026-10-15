@@ -30,7 +30,7 @@ jobs:
           python-version: '3.12'
       - name: CPU checks before building
         run: |
-          python -m py_compile aivyla_avatarforever.py aivyla_avatarforever_infer.py aivyla_avatarforever_env.py avatarforever_global_test.py aivyla_global_r2_handler.py
+          python -m py_compile aivyla_avatarforever.py aivyla_avatarforever_infer.py aivyla_avatarforever_env.py aivyla_avatarforever_smoke.py avatarforever_global_test.py aivyla_global_r2_handler.py
           python test_avatarforever.py
           python test_fast_start.py
           python test_global_r2.py
