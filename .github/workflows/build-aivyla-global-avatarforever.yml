@@ -1,11 +1,11 @@
 name: Aivyla Global AvatarForever - test image
 
 # This file's first push starts the checked candidate build on this branch.
-# Later source-only changes do not rebuild/deploy any endpoint automatically.
+# Only this workflow or its Dockerfile starts a candidate build; no deployment.
 on:
   push:
     branches: [aivyla-global]
-    paths: ['.github/workflows/build-aivyla-global-avatarforever.yml']
+    paths: ['.github/workflows/build-aivyla-global-avatarforever.yml', 'Dockerfile.global-avatarforever']
   workflow_dispatch:
 
 permissions:
