@@ -75,7 +75,8 @@ class EnvironmentBridgeTests(unittest.TestCase):
                 archive.writestr(module+'.py', 'VALUE = '+repr(version)+'\n')
                 archive.writestr(info+'/METADATA', metadata)
                 archive.writestr(info+'/WHEEL', 'Wheel-Version: 1.0\nGenerator: regression-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
-                archive.writestr(info+'/RECORD', '')
+                archive.writestr(info+'/RECORD', ''.join(
+                    entry+',,\n' for entry in (module+'.py', info+'/METADATA', info+'/WHEEL', info+'/RECORD')))
             return path
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -94,9 +95,13 @@ class EnvironmentBridgeTests(unittest.TestCase):
                 subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(old)],
                                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
                 wheel(wheels, name, TARGET_PACKAGE_PINS[name])
-            link_dependencies(base/'bin/python', target/'bin/python')
+            diffusers = wheel(wheels, 'diffusers', '0.41.0', ['huggingface-hub>=1.32,<2'])
+            subprocess.run([str(base/'bin/python'), '-m', 'pip', 'install', '--no-index', str(diffusers)],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            roots = ('pip', 'aivyla-base-lock-fixture')
+            link_dependencies(base/'bin/python', target/'bin/python', roots=roots)
             constraints = root/'base-constraints.txt'
-            pins = freeze_base(base/'bin/python', constraints)
+            pins = freeze_base(base/'bin/python', constraints, roots=roots)
             self.assertEqual(pins['aivyla-base-lock-fixture'], '1.2.3')
             for name, version in TARGET_PACKAGE_PINS.items():
                 self.assertEqual(pins[name], version)
@@ -108,16 +113,24 @@ class EnvironmentBridgeTests(unittest.TestCase):
                        '--find-links', str(wheels), '--constraint', str(constraints)]
             subprocess.run([*install, str(consumer)], check=True, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, timeout=60)
-            probe = ('from importlib.metadata import version; import aivyla_base_lock_fixture as b; '
+            probe = ('from importlib.metadata import version; from pathlib import Path; import aivyla_base_lock_fixture as b; '
                      'import aivyla_missing_dep_fixture as m; '
                      'print(version("aivyla-base-lock-fixture"), version("aivyla-missing-dep-fixture")); '
-                     'print(b.__file__); print(m.__file__)')
+                     'print(Path(b.__file__).resolve()); print(m.__file__)')
             result = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe], text=True)
             self.assertEqual(result.splitlines()[0], '1.2.3 4.5.6')
             self.assertTrue(result.splitlines()[1].startswith(str(base)))
             self.assertTrue(result.splitlines()[2].startswith(str(target)))
             checked = subprocess.check_output([str(target/'bin/python'), '-m', 'pip', 'check'], text=True)
             self.assertIn('No broken requirements found', checked)
+            absent = subprocess.check_output([str(target/'bin/python'), '-I', '-c',
+                'import importlib.util; from importlib.metadata import distributions; '
+                'assert importlib.util.find_spec("diffusers") is None; '
+                'assert "diffusers" not in {d.metadata["Name"] for d in distributions()}; print("isolated")'], text=True)
+            self.assertEqual(absent.strip(), 'isolated')
+            self.assertNotIn('diffusers', pins)
+            base_checked = subprocess.check_output([str(base/'bin/python'), '-m', 'pip', 'check'], text=True)
+            self.assertIn('No broken requirements found', base_checked)
             for name, version in TARGET_PACKAGE_PINS.items():
                 probe_stack = ('from importlib.metadata import version; import '
                                + name.replace('-', '_') + ' as m; print(version('
@@ -145,14 +158,16 @@ class EnvironmentBridgeTests(unittest.TestCase):
             subprocess.run([sys.executable, '-m', 'venv', str(base)],
                            check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             subprocess.run([str(base/'bin/python'), '-m', 'venv', '--without-pip',
-                            '--system-site-packages', str(target)], check=True, timeout=60)
+                            str(target)], check=True, timeout=60)
             source = Path(environment(base/'bin/python')['purelib'])
             package = source / 'aivyla_base_fixture.py'
             package.write_text('VALUE = 173\n')
             metadata = source / 'aivyla_base_fixture-1.2.3.dist-info'
             metadata.mkdir()
             (metadata/'METADATA').write_text('Metadata-Version: 2.1\nName: aivyla-base-fixture\nVersion: 1.2.3\n')
+            (metadata/'RECORD').write_text('aivyla_base_fixture.py,,\naivyla_base_fixture-1.2.3.dist-info/METADATA,,\naivyla_base_fixture-1.2.3.dist-info/RECORD,,\n')
             target_site = Path(environment(target/'bin/python')['purelib'])
+            (target_site/'__pycache__').mkdir(exist_ok=True)
             dependent = target_site/'aivyla_target_fixture-1.0.dist-info'
             dependent.mkdir()
             (dependent/'METADATA').write_text('Metadata-Version: 2.1\nName: aivyla-target-fixture\n'
@@ -164,13 +179,18 @@ class EnvironmentBridgeTests(unittest.TestCase):
             missing = subprocess.run([str(target/'bin/python'), '-I', '-c', probe],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertNotEqual(missing.returncode, 0, 'Regression fixture must reproduce missing sibling deps')
-            result = link_dependencies(base/'bin/python', target/'bin/python')
+            roots = ('pip', 'aivyla-base-fixture')
+            result = link_dependencies(base/'bin/python', target/'bin/python', roots=roots)
+            self.assertFalse((target_site/'__pycache__').is_symlink())
             output = subprocess.check_output([str(target/'bin/python'), '-I', '-c', probe], text=True)
             self.assertEqual(output.strip(), '173 1.2.3')
             checked = subprocess.check_output([str(target/'bin/python'), '-I', '-m', 'pip', 'check'], text=True)
             self.assertIn('No broken requirements found', checked)
-            link_dependencies(base/'bin/python', target/'bin/python')
-            self.assertEqual(Path(result['bridge']).read_text().count('addsitedir'), 1)
+            link_dependencies(base/'bin/python', target/'bin/python', roots=roots)
+            self.assertEqual(set(result['shared_packages']), {'pip', 'aivyla-base-fixture'})
+            visible = json.loads(subprocess.check_output([str(target/'bin/python'), '-I', '-c',
+                                 'import json,sys; print(json.dumps(sys.path))'], text=True))
+            self.assertNotIn(str(source), visible)
             # Imports can create bytecode; all original base files remain byte-identical.
             for name, data in before.items():
                 self.assertEqual((base/name).read_bytes(), data, name)

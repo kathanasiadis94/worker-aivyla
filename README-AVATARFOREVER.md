@@ -21,11 +21,14 @@ are not silently substituted into these experiments.
   workflow dispatch. No workflow deploys an endpoint.
 - Image tag: `ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-avatarforever-ci-<run_number>`.
 - Upstream code is pinned to `de4deb6a55c9567a17dad58d67390fe089993630`.
-- The sibling venv reuses the base image's installed CUDA torch through an
-  explicit read-only site-packages bridge. `--system-site-packages` alone
-  cannot expose another venv. Upstream packages are installed into the
-  sibling venv with their full dependency graph. Inherited package versions
-  remain constrained except for the explicitly isolated Gemma stack:
+- The isolated sibling venv shares only the installed distributions needed
+  by `torch`, `torchaudio`, `torchvision`, `triton`, and pip bootstrap.
+  Their dependency closure is derived from the actual base metadata and
+  linked into the target, with exact constraints and bytecode writes disabled.
+  The base site-packages directory and its `.pth` files are never exposed.
+  ComfyUI packages, including its `diffusers`, are absent from the target.
+  Other upstream dependencies are installed with their complete graph there.
+  The Gemma stack is pinned to:
   `transformers==4.57.6`, `huggingface-hub==0.36.2`, `tokenizers==0.22.2`.
   These load from the sibling venv; ComfyUI retains its own versions.
   Missing packages such as accelerate are installed into the sibling venv.

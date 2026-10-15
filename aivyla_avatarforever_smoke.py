@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import importlib
-from importlib.metadata import distributions
+from importlib.metadata import distributions, version
 import json
 from pathlib import Path
 import pkgutil
 import sys
 
 
-def main():
+def main(runtime_root=Path('/opt/avatarforever')):
     import torch
     import ltx_core
     import ltx_pipelines
@@ -20,8 +20,30 @@ def main():
     from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
     from ltx_core.model.transformer.attention import PytorchAttention
 
-    if not torch.__file__.startswith('/opt/venv/'):
-        raise RuntimeError('Refuse a replacement CUDA torch: ' + torch.__file__)
+    shared = json.loads((Path(sys.prefix) / 'aivyla_shared_runtime.json').read_text())
+    torch_path = Path(torch.__file__).resolve()
+    if not any(torch_path.is_relative_to(Path(site)) for site in shared['base_sites']):
+        raise RuntimeError('Refuse a replacement CUDA torch: ' + str(torch_path))
+    if any(str(Path(site)) in sys.path for site in shared['base_sites']):
+        raise RuntimeError('ComfyUI site-packages leaked into AvatarForever sys.path')
+    for name, expected in shared['shared_packages'].items():
+        if version(name) != expected:
+            raise RuntimeError('Shared CUDA dependency was replaced: ' + name)
+    if importlib.util.find_spec('diffusers') is not None:
+        raise RuntimeError('ComfyUI diffusers leaked into isolated AvatarForever environment')
+    import torchaudio
+    import torchvision
+    for module in (torchaudio, torchvision):
+        if not any(Path(module.__file__).resolve().is_relative_to(Path(site))
+                   for site in shared['base_sites']):
+            raise RuntimeError('Shared CUDA extension was replaced: ' + module.__name__)
+    audio = torchaudio.functional.resample(torch.ones(1, 160), 16000, 8000)
+    if audio.shape != (1, 80) or not torch.isfinite(audio).all():
+        raise RuntimeError('Shared torchaudio CPU resampling failed')
+    kept = torchvision.ops.nms(torch.tensor([[0., 0., 2., 2.], [0., 0., 2., 2.]]),
+                               torch.tensor([.9, .8]), .5)
+    if kept.tolist() != [0]:
+        raise RuntimeError('Shared torchvision native CPU operation failed')
     # Import every packaged module, including paths reached only at generation.
     imported = []
     for package in (ltx_core, ltx_pipelines):
@@ -46,14 +68,20 @@ def main():
         raise RuntimeError('AvatarForever pipeline is unavailable')
     gemma_check = check_gemma_runtime()
     report = dict(python=sys.version, torch=torch.__version__, cuda=torch.version.cuda,
-                  torch_path=torch.__file__, accelerate=accelerate.__version__,
+                  torch_path=str(torch_path), accelerate=accelerate.__version__,
                   imported_modules=len(imported), attention_cpu='passed', lora_fusion_cpu='passed',
-                  gemma=gemma_check)
-    Path('/opt/avatarforever/runtime-check.json').write_text(json.dumps(report, indent=2))
+                  gemma=gemma_check, isolated_dependencies=True, shared_native_ops_cpu='passed',
+                  shared_packages=shared['shared_packages'])
+    runtime_root = Path(runtime_root)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    (runtime_root/'runtime-check.json').write_text(json.dumps(report, indent=2))
     pinned = sorted({d.metadata['Name'] + '==' + d.version for d in distributions()})
-    Path('/opt/avatarforever/resolved-requirements.txt').write_text('\n'.join(pinned) + '\n')
+    (runtime_root/'resolved-requirements.txt').write_text('\n'.join(pinned) + '\n')
     print('PASS: complete AvatarForever CPU runtime ' + json.dumps(report), flush=True)
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--runtime-root', type=Path, default=Path('/opt/avatarforever'))
+    main(parser.parse_args().runtime_root)
