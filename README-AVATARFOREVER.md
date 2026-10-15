@@ -80,6 +80,10 @@ Unsupported keys or partial/zero mapping fail instead of being ignored.
 
 ComfyUI's queue must be idle. Its model cache is unloaded through `/free`
 before starting the isolated GPU process, with a check for released VRAM.
+Both the capabilities check and GPU preflight wait for a valid `/queue`
+response before proceeding. Startup connection failures are retried for up to
+180 seconds (`AIVYLA_AVATARFOREVER_COMFY_READY_TIMEOUT_SECONDS`, at most 600).
+An exited ComfyUI PID fails immediately. A busy queue is never unloaded.
 
 ## Run from the Studio server
 

@@ -47,6 +47,8 @@ DEFAULT_PROMPT = (
 JOB_LOCK = threading.Lock()
 MAX_MEDIA_BYTES = 32 * 1024**2
 COMFY_OUTPUT_ROOT = Path('/comfyui/output')
+COMFY_API = 'http://127.0.0.1:8188'
+COMFY_PID_FILE = Path('/tmp/comfyui.pid')
 
 
 def validate_payload(payload):
@@ -252,14 +254,70 @@ def runtime_preflight():
     return python, repo
 
 
+def comfy_process_alive():
+    """None means the launcher has not supplied a PID; the deadline still applies."""
+    try:
+        pid = int(COMFY_PID_FILE.read_text().strip())
+        if pid <= 0:
+            raise ValueError('non-positive PID')
+    except FileNotFoundError:
+        return None
+    except ValueError as exc:
+        raise RuntimeError('Invalid ComfyUI PID file; inspect worker startup logs') from exc
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A dead child can remain a zombie while its shell parent runs the handler.
+    try:
+        state = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()[0]
+        return state not in ('Z', 'X')
+    except FileNotFoundError:
+        return False
+
+
+def wait_for_comfy_queue(*, timeout_seconds=None, poll_seconds=1.0):
+    """Wait for the actual API, without unloading models or submitting any work."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import urlopen
+    seconds = float(timeout_seconds if timeout_seconds is not None else
+                    os.getenv('AIVYLA_AVATARFOREVER_COMFY_READY_TIMEOUT_SECONDS', '180'))
+    if not math.isfinite(seconds) or not 0 < seconds <= 600:
+        raise ValueError('ComfyUI readiness timeout must be >0 and <=600 seconds')
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError('ComfyUI readiness poll interval must be positive')
+    started = time.monotonic()
+    deadline = started + seconds
+    print('AvatarForever: waiting for ComfyUI API readiness', flush=True)
+    while True:
+        if comfy_process_alive() is False:
+            raise RuntimeError('ComfyUI process exited before API readiness; inspect worker startup logs')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f'ComfyUI API did not become ready within {seconds:g}s; inspect worker startup logs')
+        try:
+            with urlopen(COMFY_API + '/queue', timeout=min(5, remaining)) as response:
+                queue = json.load(response)
+        except HTTPError:
+            raise  # An actual server error is not an unopened startup socket.
+        except (URLError, TimeoutError):
+            time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
+            continue
+        if (not isinstance(queue, dict) or
+                any(not isinstance(queue.get(key), list) for key in ('queue_running', 'queue_pending'))):
+            raise RuntimeError('ComfyUI /queue returned an invalid response')
+        print(f'AvatarForever: ComfyUI API ready after {time.monotonic() - started:.2f}s', flush=True)
+        return queue
+
+
 def free_comfy_gpu():
     import requests
-    response = requests.get('http://127.0.0.1:8188/queue', timeout=(3, 10))
-    response.raise_for_status()
-    queue = response.json()
+    queue = wait_for_comfy_queue()
     if queue.get('queue_running') or queue.get('queue_pending'):
         raise RuntimeError('ComfyUI has active/queued work; retry when idle')
-    response = requests.post('http://127.0.0.1:8188/free',
+    response = requests.post(COMFY_API + '/free',
                              json={'unload_models': True, 'free_memory': True}, timeout=(3, 10))
     response.raise_for_status()
     # /free is serviced asynchronously by ComfyUI. Wait for actual VRAM release.
@@ -344,10 +402,11 @@ def run_comparison(job, payload):
         return {'error': 'AvatarForever test is disabled on this worker'}
     if payload.get('action') == 'capabilities':
         runtime_preflight()
+        wait_for_comfy_queue()
         return dict(engine=ENGINE, enabled=True, upstream_revision=UPSTREAM_REVISION,
                     bucket=os.getenv('AIVYLA_AVATARFOREVER_R2_BUCKET', 'aivyla-models-v2'),
                     variants=list(VARIANTS), max_seconds=40,
-                    model_downloads_started=False, generation_started=False)
+                    comfy_api_ready=True, model_downloads_started=False, generation_started=False)
     settings = validate_payload(payload)
     job_id = job.get('id')
     if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', job_id):
