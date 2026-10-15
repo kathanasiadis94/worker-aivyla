@@ -346,6 +346,41 @@ class LoraAuditTests(unittest.TestCase):
 
 
 class JobTests(unittest.TestCase):
+    def test_build_import_from_unrelated_directory_uses_real_sibling_modules(self):
+        # Build uses python -c + runpy from /, whereas runtime executes the
+        # wrapper file directly. Only the latter adds its parent to sys.path.
+        root = Path(__file__).resolve().parent
+        preamble = '''import runpy, sys, types
+sys.modules['runpod'] = types.ModuleType('runpod')
+def validate_workflow_models(workflow):
+    return None
+def handler(job):
+    return {}
+original_run_path = runpy.run_path
+def intercepted(path, **kwargs):
+    if path == '/handler.py':
+        return {'handler': handler}
+    return original_run_path(path, **kwargs)
+runpy.run_path = intercepted
+'''
+        command = ("scope=runpy.run_path(" + repr(str(root/'aivyla_global_r2_handler.py'))
+                   + ", run_name='avatarforever_build_smoke'); "
+                   + "assert callable(scope['handler']); print('PASS')")
+        env = dict(os.environ)
+        env.pop('PYTHONPATH', None)
+        with tempfile.TemporaryDirectory() as directory:
+            old = subprocess.run([sys.executable, '-c', preamble+command], cwd=directory,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertNotEqual(old.returncode, 0)
+            self.assertIn("No module named 'aivyla_r2_stage'", old.stderr)
+            fixed = preamble + 'sys.path.insert(0, ' + repr(str(root)) + ')\n' + command
+            new = subprocess.run([sys.executable, '-c', fixed], cwd=directory,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(new.returncode, 0, new.stderr)
+            self.assertEqual(new.stdout.strip(), 'PASS')
+        docker = (root/'Dockerfile.global-avatarforever').read_text()
+        self.assertIn("sys.path.insert(0, '/opt/aivyla-global'); scope=runpy.run_path", docker)
+
     def fake_comparison(self, fail_on=None):
         with tempfile.TemporaryDirectory() as directory:
             transport = types.ModuleType('aivyla_output_upload')

@@ -15,9 +15,10 @@ are not silently substituted into these experiments.
 
 - Branch: `aivyla-global` only.
 - Dockerfile: `Dockerfile.global-avatarforever`.
-- Workflow: `build-aivyla-global-avatarforever.yml`. Its first push triggers
-  CPU checks and an isolated linux/amd64 image build. Later source-only
-  changes do not trigger builds. No workflow deploys an endpoint.
+- Workflow: `build-aivyla-global-avatarforever.yml`. Pushes changing this
+  workflow or its Dockerfile trigger CPU checks and an isolated linux/amd64
+  image build on `aivyla-global`. Other source-only changes need a manual
+  workflow dispatch. No workflow deploys an endpoint.
 - Image tag: `ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-avatarforever-ci-<run_number>`.
 - Upstream code is pinned to `de4deb6a55c9567a17dad58d67390fe089993630`.
 - The sibling venv reuses the base image's installed CUDA torch through an

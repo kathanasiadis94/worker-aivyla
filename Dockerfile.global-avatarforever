@@ -23,7 +23,7 @@ RUN git init /opt/avatarforever/repo \
  && /opt/avatarforever/venv/bin/python /opt/aivyla-global/aivyla_avatarforever_smoke.py \
  && /opt/avatarforever/venv/bin/python /opt/avatarforever/repo/inference.py --help \
  && python -m py_compile /opt/aivyla-global/*.py /handler.py /aivyla_preview.py /aivyla_output_upload.py \
- && python -c "import runpy; scope=runpy.run_path('/opt/aivyla-global/aivyla_global_r2_handler.py', run_name='avatarforever_build_smoke'); assert callable(scope['handler']); print('PASS: Global AvatarForever handler import')" \
+ && python -c "import runpy, sys; sys.path.insert(0, '/opt/aivyla-global'); scope=runpy.run_path('/opt/aivyla-global/aivyla_global_r2_handler.py', run_name='avatarforever_build_smoke'); assert callable(scope['handler']); print('PASS: Global AvatarForever handler import')" \
  && command -v ffmpeg && command -v ffprobe
 
 ENV AIVYLA_FAST_REQUIREMENTS=1 \
