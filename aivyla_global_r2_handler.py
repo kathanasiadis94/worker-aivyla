@@ -138,6 +138,11 @@ def handler(job):
         payload = job.get('input', {})
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if isinstance(payload, dict) and payload.get('engine') == 'avatarforever_test':
+            if os.getenv('AIVYLA_AVATARFOREVER_ENABLED', '0') != '1':
+                return {'error': 'AvatarForever test is disabled on this worker'}
+            from aivyla_avatarforever import run_comparison
+            return run_comparison(job, payload)
         if isinstance(payload, dict) and isinstance(payload.get('workflow'), dict):
             _maybe_attach_animated_ltx_preview(payload)
             summary = stage_workflow(payload['workflow'])
@@ -145,7 +150,9 @@ def handler(job):
                   f' wrapper_s={time.monotonic()-started:.2f}', flush=True)
     except Exception as exc:
         traceback.print_exc()
-        return {'error': 'R2 model staging failed', 'details': [f'{type(exc).__name__}: {exc}']}
+        label = ('AvatarForever test failed' if isinstance(locals().get('payload'), dict)
+                 and payload.get('engine') == 'avatarforever_test' else 'R2 model staging failed')
+        return {'error': label, 'details': [f'{type(exc).__name__}: {exc}']}
     return _original(job)
 
 

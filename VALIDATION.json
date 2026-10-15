@@ -1,0 +1,19 @@
+{
+  "cpu_tests_passed": 68,
+  "new_avatarforever_tests": 23,
+  "gpu_generation_run": false,
+  "docker_build_run": false,
+  "github_written": false,
+  "target_repository": "kathanasiadis94/worker-aivyla",
+  "target_branch": "aivyla-global",
+  "github_base_commit": "04a0eb1f205f62beb093f094c2f896bf033063dd",
+  "github_write_error": "403 Resource not accessible by integration",
+  "models_bucket": "aivyla-models-v2",
+  "variants": [
+    "BASE",
+    "OMNI1",
+    "OMNI2"
+  ],
+  "seconds_default": 10,
+  "seconds_maximum": 40
+}

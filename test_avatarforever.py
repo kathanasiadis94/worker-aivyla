@@ -1,0 +1,345 @@
+"""CPU regressions: payload limits, exact R2 bundle, strict LoRAs and dispatch."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib.util
+import json
+import io
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+import wave
+from unittest import mock
+
+import aivyla_avatarforever as av
+from aivyla_avatarforever_infer import audit_lora
+from avatarforever_global_test import resolve_endpoint
+
+
+def payload(**extra):
+    return dict(engine=av.ENGINE, output_transport='studio', image='eA==', audio='eA==', **extra)
+
+
+class MissingObject(Exception):
+    response = {'Error': {'Code': 'NoSuchKey'}}
+
+
+class FakeS3:
+    def __init__(self):
+        self.objects = {}
+        self.downloads = []
+        self.corrupt = False
+        self.change = False
+
+    def add(self, key, data):
+        self.objects[key] = data
+
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise MissingObject(Key)
+        data = self.objects[Key]
+        etag = hashlib.sha256(data).hexdigest()
+        if self.change and Key in self.downloads:
+            etag = 'changed'
+        return dict(ContentLength=len(data), ETag='"' + etag + '"',
+                    Metadata={'sha256': hashlib.sha256(data).hexdigest()})
+
+    def download_file(self, bucket, key, filename, Config):
+        self.downloads.append(key)
+        data = self.objects[key]
+        Path(filename).write_bytes(b'!' * len(data) if self.corrupt else data)
+
+
+class PayloadTests(unittest.TestCase):
+    def test_default_three_variants_and_limits(self):
+        settings = av.validate_payload(payload())
+        self.assertEqual(settings['variants'], ['BASE', 'OMNI1', 'OMNI2'])
+        self.assertEqual(settings['seconds'], 10)
+        self.assertEqual(av.validate_payload(payload(seconds=40))['seconds'], 40)
+        for value in [0, -1, 40.01, True, float('nan'), float('inf'), '10']:
+            with self.assertRaises(ValueError, msg=str(value)):
+                av.validate_payload(payload(seconds=value))
+
+    def test_reject_mixed_graph_or_unknown_lora(self):
+        for change in [dict(workflow={}), dict(variants=['BASE', 'BASE']),
+                       dict(variants=['FACEID']), dict(variants='BASE'),
+                       dict(variants=[]), dict(seed=True), dict(seed=2**32),
+                       dict(width=768, height=768), dict(width=769),
+                       dict(width=128, height=512)]:
+            with self.assertRaises(ValueError, msg=str(change)):
+                av.validate_payload(payload(**change))
+
+    def test_no_production_endpoint_fallback(self):
+        with self.assertRaisesRegex(ValueError, 'fallback is disabled'):
+            resolve_endpoint(None, {'RUNPOD_ENDPOINT_ID': 'production-only'})
+        self.assertEqual(resolve_endpoint(None, {'AIVYLA_GLOBAL_ENDPOINT_ID': 'global-test'}), 'global-test')
+        with self.assertRaisesRegex(ValueError, 'Conflicting'):
+            resolve_endpoint(None, {'AIVYLA_GLOBAL_ENDPOINT_ID': 'one', 'RUNPOD_GLOBAL_ENDPOINT_ID': 'two'})
+
+    def test_decode_only_base64_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, 'input')
+            av.decode_media('data:audio/wav;base64,eA==', path)
+            self.assertEqual(path.read_bytes(), b'x')
+            for value in ['https://example.com/audio.wav', 'file:///etc/passwd', '', 'data:audio/wav,abc']:
+                with self.assertRaises(ValueError):
+                    av.decode_media(value, path)
+
+    def test_frame_alignment_and_padding_duration(self):
+        for seconds in [0.01, 1, 7.5, 10, 30, 40]:
+            frames = av.frame_count(seconds)
+            self.assertEqual((frames - 1) % 8, 0)
+            self.assertGreaterEqual(frames / 25, seconds)
+            self.assertLess(frames / 25 - seconds, 8 / 25 + 1e-6)
+
+    @unittest.skipUnless(__import__('shutil').which('ffmpeg'), 'ffmpeg not installed')
+    def test_real_media_fit_pad_and_short_audio(self):
+        import struct
+        import zlib
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        png = b'\x89PNG\r\n\x1a\n'
+        png += chunk(b'IHDR', struct.pack('>IIBBBBB', 32, 64, 8, 2, 0, 0, 0))
+        png += chunk(b'IDAT', zlib.compress((b'\0' + b'\xff\0\0' * 32) * 64))
+        png += chunk(b'IEND', b'')
+        stream = io.BytesIO()
+        with wave.open(stream, 'wb') as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(b'\0\0' * 11200)
+        data = payload()
+        data.update(image=base64.b64encode(png).decode(), audio=base64.b64encode(stream.getvalue()).decode())
+        settings = av.validate_payload(data)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            av.prepare_media(data, settings, work)
+            self.assertAlmostEqual(settings['seconds'], .7)
+            actual = float(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries',
+                           'format=duration', '-of', 'default=nw=1:nk=1', str(work/'conditioning.wav')]))
+            self.assertAlmostEqual(actual, settings['frames']/25, places=3)
+            dimensions = subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries',
+                          'stream=width,height', '-of', 'csv=p=0', str(work/'conditioning.png')], text=True)
+            self.assertEqual(dimensions.strip(), '768,512')
+
+
+class BundleTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.s3 = FakeS3()
+        self.stager = av.BundleStager(self.directory.name, client=self.s3)
+        transfer = types.ModuleType('boto3.s3.transfer')
+        transfer.TransferConfig = lambda **kw: kw
+        modules = {'boto3': types.ModuleType('boto3'), 'boto3.s3': types.ModuleType('boto3.s3'),
+                   'boto3.s3.transfer': transfer}
+        patch = mock.patch.dict(sys.modules, modules)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def add_bundle(self):
+        self.s3.add('models/split_files/checkpoints/' + av.CHECKPOINT, b'checkpoint')
+        for name in av.GEMMA_FILES:
+            data = b'{}'
+            if name == 'model.safetensors.index.json':
+                data = json.dumps({'weight_map': {str(i): f'model-{i:05d}-of-00005.safetensors'
+                                                  for i in range(1, 6)}}).encode()
+            self.s3.add(f'models/text_encoders/{av.GEMMA}/{name}', data)
+
+    def test_exact_17_files_include_tokenizers_and_metadata(self):
+        self.add_bundle()
+        jobs = self.stager.plan(False)
+        self.assertEqual(self.stager.bucket, 'aivyla-models-v2')
+        self.assertEqual(len(jobs), 17)
+        paths = {dst.relative_to(self.stager.root).as_posix() for _, dst in jobs}
+        self.assertIn(f'checkpoints/{av.GEMMA}/tokenizer.model', paths)
+        self.assertIn(f'checkpoints/{av.GEMMA}/config.json', paths)
+
+    def test_cached_repeat_does_not_download(self):
+        self.add_bundle()
+        first = self.stager.stage(False)
+        self.assertEqual(first['downloaded'], 17)
+        second = self.stager.stage(False)
+        self.assertEqual(second['cached'], 17)
+        self.assertEqual(len(self.s3.downloads), 17)
+
+    def test_checksum_failure_never_publishes_cache(self):
+        key = 'models/test.bin'
+        self.s3.add(key, b'good')
+        self.s3.corrupt = True
+        path = self.stager.root / 'test.bin'
+        with self.assertRaisesRegex(ValueError, 'SHA256 mismatch'):
+            self.stager.fetch((self.stager.head(key), path))
+        self.assertFalse(path.exists())
+        self.assertFalse(self.stager.receipt(path).exists())
+        self.assertFalse(path.with_name('test.bin.part').exists())
+
+    def test_changed_remote_object_never_publishes_cache(self):
+        key = 'models/test.bin'
+        self.s3.add(key, b'good')
+        self.s3.change = True
+        path = self.stager.root / 'test.bin'
+        with self.assertRaisesRegex(ValueError, 'changed during download'):
+            self.stager.fetch((self.stager.head(key), path))
+        self.assertFalse(path.exists())
+
+    def test_preflight_missing_omni_has_no_download(self):
+        self.add_bundle()
+        with self.assertRaises(FileNotFoundError):
+            self.stager.stage(True)
+        self.assertEqual(self.s3.downloads, [])
+
+    def test_omni_fallback_and_split_priority(self):
+        self.add_bundle()
+        key = f'models/loras/{av.OMNINFT}'
+        self.s3.add(key, b'fallback')
+        self.assertEqual(self.stager.plan(True)[-1][0].key, key)
+        split = f'models/split_files/loras/{av.OMNINFT}'
+        self.s3.add(split, b'preferred')
+        self.assertEqual(self.stager.plan(True)[-1][0].key, split)
+
+    def test_insufficient_disk_fails_before_download(self):
+        self.add_bundle()
+        with mock.patch.object(av.shutil, 'disk_usage', return_value=types.SimpleNamespace(free=1)):
+            with self.assertRaisesRegex(RuntimeError, 'local disk needs'):
+                self.stager.stage(False)
+        self.assertEqual(self.s3.downloads, [])
+
+
+class LoraAuditTests(unittest.TestCase):
+    def test_valid_pairs(self):
+        self.assertEqual(audit_lora({'x.weight': (8, 16)},
+                                   {'x.lora_A.weight': (2, 16), 'x.lora_B.weight': (8, 2)}), 1)
+
+    def test_no_silent_missing_partial_or_wrong_shape(self):
+        for tensors in [{}, {'x.lora_A.weight': (2, 16)},
+                        {'x.alpha': ()},
+                        {'z.lora_A.weight': (2, 16), 'z.lora_B.weight': (8, 2)},
+                        {'x.lora_A.weight': (3, 16), 'x.lora_B.weight': (8, 2)},
+                        {'x.lora_A.weight': (2, 20), 'x.lora_B.weight': (8, 2)}]:
+            with self.assertRaises(ValueError):
+                audit_lora({'x.weight': (8, 16)}, tensors)
+
+
+class JobTests(unittest.TestCase):
+    def fake_comparison(self, fail_on=None):
+        with tempfile.TemporaryDirectory() as directory:
+            transport = types.ModuleType('aivyla_output_upload')
+            transport.check_transport_ready = mock.Mock()
+            transport.upload_comfy_output = mock.Mock(side_effect=lambda job, filename, subfolder, kind, index:
+                                                     {'filename': filename, 'type': 'aivyla_upload',
+                                                      'data': f'{job}:{index}'})
+            calls = []
+            def media(data, settings, work):
+                settings['frames'] = 257
+                return work / 'audio'
+            def inference(command, cwd, log, timeout):
+                raw = Path(command[command.index('--output-path')+1])
+                name = raw.name.split('-')[0]
+                calls.append((name, command))
+                if name == fail_on:
+                    raise RuntimeError('synthetic inference failure')
+                report = Path(command[command.index('--aivyla-report')+1])
+                report.write_text(json.dumps({'lora_audit': [], 'fusion_calls': [], 'gpu_peak_allocated_gib': 1}))
+            stager = mock.Mock()
+            stager.stage.return_value = {'files': 18}
+            with mock.patch.dict(sys.modules, {'aivyla_output_upload': transport}), \
+                    mock.patch.object(av, 'COMFY_OUTPUT_ROOT', Path(directory)), \
+                    mock.patch.object(av, 'runtime_preflight', return_value=(Path('/python'), Path('/repo'))), \
+                    mock.patch.object(av, 'prepare_media', side_effect=media), \
+                    mock.patch.object(av, 'free_comfy_gpu', return_value=80000), \
+                    mock.patch.object(av, 'progress'), \
+                    mock.patch.object(av, 'BundleStager', return_value=stager), \
+                    mock.patch.object(av, 'run_logged', side_effect=inference), \
+                    mock.patch.object(av.subprocess, 'run'):
+                data = payload()
+                result = av._run_comparison({'id': 'test-job'}, data, av.validate_payload(data))
+            return result, calls, transport
+
+    def test_one_request_three_outputs_separate_processes(self):
+        result, calls, transport = self.fake_comparison()
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual([item['variant'] for item in result['images']], ['BASE', 'OMNI1', 'OMNI2'])
+        self.assertEqual(transport.upload_comfy_output.call_count, 3)
+        self.assertNotIn('--lora', calls[0][1])
+        self.assertEqual(calls[1][1][-1], '1.0')
+        self.assertEqual(calls[2][1][-1], '2.0')
+
+    def test_failed_variant_preserves_delivered_baseline(self):
+        result, calls, transport = self.fake_comparison(fail_on='OMNI1')
+        self.assertIn('OMNI1 failed', result['error'])
+        self.assertEqual(len(result['images']), 1)
+        self.assertEqual(result['images'][0]['variant'], 'BASE')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(transport.upload_comfy_output.call_count, 1)
+
+    def test_disabled_route_does_not_start_runtime(self):
+        with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_ENABLED': '0'}), \
+                mock.patch.object(av, 'runtime_preflight') as runtime:
+            self.assertIn('disabled', av.run_comparison({'id': 'job'}, payload())['error'])
+            runtime.assert_not_called()
+
+    def test_capabilities_does_not_stage_or_generate(self):
+        with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_ENABLED': '1'}), \
+                mock.patch.object(av, 'runtime_preflight'), \
+                mock.patch.object(av, 'BundleStager') as staging:
+            result = av.run_comparison({'id': 'job'}, {'action': 'capabilities'})
+            self.assertEqual(result['bucket'], 'aivyla-models-v2')
+            self.assertFalse(result['generation_started'])
+            staging.assert_not_called()
+
+    def test_concurrent_comparison_refused(self):
+        av.JOB_LOCK.acquire()
+        try:
+            with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_ENABLED': '1'}):
+                with self.assertRaisesRegex(RuntimeError, 'Another'):
+                    av.run_comparison({'id': 'job'}, payload())
+        finally:
+            av.JOB_LOCK.release()
+
+    def test_failure_releases_lock(self):
+        with mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_ENABLED': '1'}), \
+                mock.patch.object(av, '_run_comparison', side_effect=RuntimeError('failed')):
+            with self.assertRaises(RuntimeError):
+                av.run_comparison({'id': 'job'}, payload())
+        self.assertFalse(av.JOB_LOCK.locked())
+
+    def test_timeout_terminates_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock(pid=99999)
+            process.wait.side_effect = [subprocess.TimeoutExpired('test', 1), 0]
+            with mock.patch.object(av.subprocess, 'Popen', return_value=process), \
+                    mock.patch.object(os, 'killpg') as kill:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    av.run_logged(['test'], cwd=directory, log=Path(directory, 'log'), timeout=1)
+                kill.assert_called_once()
+
+    def test_dispatch_keeps_comfy_requests_on_original_handler(self):
+        def original(job):
+            return {'legacy': True}
+        original.__globals__['validate_workflow_models'] = lambda workflow: None
+        stage = types.ModuleType('aivyla_r2_stage')
+        stage.stage_workflow = mock.Mock(return_value={})
+        runpod = types.ModuleType('runpod')
+        with mock.patch.dict(sys.modules, {'runpod': runpod, 'aivyla_r2_stage': stage}), \
+                mock.patch.object(runpy, 'run_path', return_value={'handler': original}):
+            spec = importlib.util.spec_from_file_location('test_global_avatar_dispatch',
+                                                         Path(__file__).with_name('aivyla_global_r2_handler.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        with mock.patch.object(av, 'run_comparison', return_value={'avatar': True}) as compare, \
+                mock.patch.dict(os.environ, {'AIVYLA_AVATARFOREVER_ENABLED': '1'}):
+            self.assertEqual(module.handler({'id': 'job', 'input': payload()}), {'avatar': True})
+            self.assertEqual(module.handler({'input': {'workflow': {}}}), {'legacy': True})
+            compare.assert_called_once()
+            stage.stage_workflow.assert_called_once()
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
