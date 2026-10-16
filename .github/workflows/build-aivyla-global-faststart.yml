@@ -94,6 +94,5 @@ jobs:
           echo 'Aivyla production and all RunPod endpoints remain unchanged.'
 # Trigger isolated Aivyla CDN build
 # Trigger Universal CDN v2 isolated build bugs
-# Trigger live preview v4 
-# Trigger Tigris test build 2026-10-16
-
+# Trigger live preview v4
+# Trigger environment-tunable isolated Tigris image (one build)
