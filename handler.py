@@ -807,6 +807,57 @@ def get_image_data(filename, subfolder, image_type):
         return None
 
 
+def _aivyla_schema_probe(job_input):
+    """Test-only, read-only ComfyUI node schema probe. Never queues /prompt."""
+    allowed = {
+        "MiniMaxH3LatentLabLongMediaSetup",
+        "MiniMaxH3LatentLabLongMediaSampler",
+        "MiniMaxH3LatentLabLongMediaDecode",
+        "MiniMaxH3LongMediaDirector",
+        "MiniMaxH3RefModsLoader",
+        "MiniMaxH3RefModApply",
+        "UNETLoader",
+        "LoraLoaderModelOnly",
+        "ModelSamplingSD3",
+        "MiniMaxH3SigmaShift",
+        "BasicGuider",
+        "BasicScheduler",
+        "KSamplerSelect",
+        "CLIPLoader",
+        "VAELoader",
+        "LoadImage",
+        "LoadAudio",
+        "VHS_VideoCombine",
+    }
+    if os.environ.get("AIVYLA_SCHEMA_PROBE_ENABLED", "0") != "1":
+        return {"error": "schema_probe disabled; test workers must set AIVYLA_SCHEMA_PROBE_ENABLED=1"}
+    requested = job_input.get("classes") if isinstance(job_input, dict) else None
+    if requested is None:
+        requested = sorted(allowed)
+    if not isinstance(requested, list) or not requested or len(requested) > len(allowed) or any(
+        not isinstance(name, str) or name not in allowed for name in requested
+    ):
+        return {"error": "classes must be a nonempty subset of the fixed schema_probe allowlist"}
+    info = _fetch_object_info()
+    if not isinstance(info, dict):
+        return {"error": "ComfyUI /object_info unavailable on this test worker"}
+    found = {}
+    missing = []
+    for name in requested:
+        node = info.get(name)
+        if not isinstance(node, dict):
+            missing.append(name)
+            continue
+        found[name] = {
+            "input": node.get("input", {}),
+            "output": node.get("output", []),
+            "output_name": node.get("output_name", []),
+        }
+    return {"operation": "schema_probe", "generation_performed": False,
+            "node_schemas": found, "missing": missing,
+            "requested_count": len(requested), "found_count": len(found)}
+
+
 def handler(job):
     """
     Handles a job using ComfyUI via websockets for status and image retrieval.
@@ -817,6 +868,12 @@ def handler(job):
     Returns:
         dict: A dictionary containing either an error message or a success status with generated images.
     """
+    # Read-only schema inspection must happen before workflow validation,
+    # uploads, queue submission, websocket setup, and output handling.
+    incoming = job.get("input") if isinstance(job, dict) else None
+    if isinstance(incoming, dict) and incoming.get("operation") == "schema_probe":
+        return _aivyla_schema_probe(incoming)
+
     # ---------------------------------------------------------------------------
     # Network Volume Diagnostics (opt-in via NETWORK_VOLUME_DEBUG=true)
     # ---------------------------------------------------------------------------
