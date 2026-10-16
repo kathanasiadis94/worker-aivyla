@@ -57,6 +57,18 @@ def parse_model(key: str, prefix='models/') -> Model | None:
     return Model(key=key, category=parts[0], filename=filename, bytes=0, etag='')
 
 
+def env_int(name, default, minimum, maximum):
+    """Strict bounded knob; fail fast on invalid environment settings."""
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name} must be an integer in [{minimum}, {maximum}]') from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f'{name} must be in [{minimum}, {maximum}]')
+    return value
+
+
 class Registry:
     def __init__(self, client=None, *, bucket=None, prefix=None, ttl=None):
         self.bucket = bucket or os.getenv('AIVYLA_R2_BUCKET', 'aivyla-models')
@@ -81,8 +93,11 @@ class Registry:
             raise ValueError('AIVYLA_R2_ENDPOINT must be a Cloudflare R2 or Tigris S3 endpoint')
         # Credentials come ONLY from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (secrets).
         # Tigris uses virtual-hosted S3 addressing; R2 retains its original behavior.
-        settings = {'signature_version': 's3v4', 'max_pool_connections': 24,
-                    'retries': {'max_attempts': 3}}
+        pool = env_int('AIVYLA_R2_MAX_POOL_CONNECTIONS', 64, 16, 256)
+        attempts = env_int('AIVYLA_R2_MAX_ATTEMPTS', 3, 1, 10)
+        settings = {'signature_version': 's3v4', 'max_pool_connections': pool,
+                    'retries': {'mode': 'standard', 'total_max_attempts': attempts}}
+        print(f'Aivyla S3 settings: pool={pool} total_attempts={attempts} endpoint={endpoint}', flush=True)
         if is_tigris:
             settings['s3'] = {'addressing_style': 'virtual'}
         return boto3.client('s3', endpoint_url=endpoint, region_name='auto',

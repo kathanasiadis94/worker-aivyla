@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 
-from aivyla_r2_registry import Registry
+from aivyla_r2_registry import Registry, env_int
 import aivyla_global_cache as legacy
 
 CACHE = Path(os.getenv('AIVYLA_GLOBAL_MODEL_ROOT', '/tmp/aivyla-model-cache'))
@@ -108,10 +108,10 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
         expected_sha = _receipt_sha(registry().client, registry().bucket, model.key, model.bytes, model.etag)
         receipt_s = time.monotonic() - start_total
         from boto3.s3.transfer import TransferConfig
-        concurrency = int(os.getenv('AIVYLA_R2_DOWNLOAD_STREAMS', '12'))
-        concurrency = max(1, min(24, concurrency))
-        config = TransferConfig(multipart_threshold=32*1024**2,
-                                multipart_chunksize=32*1024**2,
+        concurrency = env_int('AIVYLA_R2_DOWNLOAD_STREAMS', 24, 1, 64)
+        chunk_mib = env_int('AIVYLA_R2_MULTIPART_CHUNK_MIB', 32, 8, 128)
+        config = TransferConfig(multipart_threshold=chunk_mib*1024**2,
+                                multipart_chunksize=chunk_mib*1024**2,
                                 max_concurrency=concurrency, use_threads=True)
         started = time.monotonic()
         transport = 'direct_r2'
@@ -429,7 +429,14 @@ def stage_workflow(workflow):
             raise RuntimeError(f'Insufficient local cache disk: need {required/1024**3:.1f} GiB + '
                                f'{RESERVE_GIB:g} GiB reserve, have {free/1024**3:.1f} GiB')
         counts = {'r2':0, 'global':0, 'hit':0}
-        parallel = max(1, min(3, int(os.getenv('AIVYLA_R2_PARALLEL_MODELS', '2'))))
+        parallel = env_int('AIVYLA_R2_PARALLEL_MODELS', 2, 1, 4)
+        streams = env_int('AIVYLA_R2_DOWNLOAD_STREAMS', 24, 1, 64)
+        chunk = env_int('AIVYLA_R2_MULTIPART_CHUNK_MIB', 32, 8, 128)
+        pool_size = env_int('AIVYLA_R2_MAX_POOL_CONNECTIONS', 64, 16, 256)
+        attempts = env_int('AIVYLA_R2_MAX_ATTEMPTS', 3, 1, 10)
+        print(f'Aivyla Tigris transfer settings: streams={streams} parallel_models={parallel} '
+              f'pool={pool_size} chunk_mib={chunk} total_attempts={attempts} '
+              f'potential_transfers={streams*parallel}', flush=True)
         def fetch(job):
             category, filename, model, source, categories = job
             dst = CACHE/category/filename
