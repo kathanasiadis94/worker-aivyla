@@ -82,8 +82,13 @@ def _receipt_sha(client, bucket, key, expected_bytes, etag):
             return None
         raise
     data = json.loads(raw)
-    if data.get('bytes') != expected_bytes or data.get('etag') != etag:
-        raise ValueError(f'Remote receipt mismatch: {key}')
+    if data.get('bytes') != expected_bytes:
+        raise ValueError(f'Remote receipt size mismatch: {key}')
+    # Cross-provider copy preserves trusted SHA256 receipt but may change
+    # S3 multipart ETags; the full download is still hashed and verified.
+    is_tigris = os.getenv('AIVYLA_R2_ENDPOINT', '').rstrip('/') == 'https://t3.storage.dev'
+    if data.get('etag') != etag and not is_tigris:
+        raise ValueError(f'Remote receipt ETag mismatch: {key}')
     digest = data.get('sha256')
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
         raise ValueError(f'Invalid receipt SHA256: {key}')

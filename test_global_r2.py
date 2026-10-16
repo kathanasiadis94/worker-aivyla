@@ -150,6 +150,33 @@ class TestStaging(unittest.TestCase):
             stage.stage_workflow(self.workflow)
         self.assertFalse((stage.CACHE/'loras/NewNodeLoRA.safetensors').exists())
 
+    def test_tigris_copy_accepts_changed_etag_with_trusted_sha256(self):
+        key='models/loras/NewNodeLoRA.safetensors'
+        receipt={'bytes':len(self.payload),'etag':'etag-from-original-r2-object',
+                 'sha256':hashlib.sha256(self.payload).hexdigest()}
+        self.fake.add('_aivyla/receipts/'+key+'.json',json.dumps(receipt).encode())
+        with mock.patch.dict(os.environ, {'AIVYLA_R2_ENDPOINT':'https://t3.storage.dev'}):
+            result=stage.stage_workflow(self.workflow)
+        self.assertEqual(result['r2'],1)
+        self.assertEqual((stage.CACHE/'loras/NewNodeLoRA.safetensors').read_bytes(),self.payload)
+
+    def test_cloudflare_still_rejects_changed_receipt_etag(self):
+        key='models/loras/NewNodeLoRA.safetensors'
+        receipt={'bytes':len(self.payload),'etag':'different',
+                 'sha256':hashlib.sha256(self.payload).hexdigest()}
+        self.fake.add('_aivyla/receipts/'+key+'.json',json.dumps(receipt).encode())
+        with mock.patch.dict(os.environ, {'AIVYLA_R2_ENDPOINT':'https://example.r2.cloudflarestorage.com'}):
+            with self.assertRaisesRegex(ValueError,'receipt ETag mismatch'):
+                stage.stage_workflow(self.workflow)
+
+    def test_tigris_still_rejects_wrong_sha256(self):
+        key='models/loras/NewNodeLoRA.safetensors'
+        receipt={'bytes':len(self.payload),'etag':'old-r2-etag', 'sha256':'0'*64}
+        self.fake.add('_aivyla/receipts/'+key+'.json',json.dumps(receipt).encode())
+        with mock.patch.dict(os.environ, {'AIVYLA_R2_ENDPOINT':'https://t3.storage.dev'}):
+            with self.assertRaisesRegex(stage.R2IntegrityError,'SHA256 mismatch'):
+                stage.stage_workflow(self.workflow)
+
     def test_changed_remote_etag_redownloads(self):
         stage.stage_workflow(self.workflow)
         self.fake.add('models/loras/NewNodeLoRA.safetensors',sf(b'Y'*128))

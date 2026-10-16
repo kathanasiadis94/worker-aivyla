@@ -36,8 +36,10 @@ def validate_settings():
     if os.getenv('AIVYLA_R2_ENABLED', '0') != '1' and os.getenv('AIVYLA_R2_NODES_ENABLED', '0') != '1':
         return
     endpoint = os.getenv('AIVYLA_R2_ENDPOINT', '')
-    if not endpoint.startswith('https://') or not endpoint.rstrip('/').endswith('.r2.cloudflarestorage.com'):
-        raise RuntimeError('AIVYLA_R2_ENDPOINT must be configured in test endpoint')
+    endpoint = endpoint.rstrip('/')
+    is_r2 = endpoint.startswith('https://') and endpoint.endswith('.r2.cloudflarestorage.com')
+    if not (is_r2 or endpoint == 'https://t3.storage.dev'):
+        raise RuntimeError('AIVYLA_R2_ENDPOINT must be Cloudflare R2 or Tigris in test endpoint')
     if not os.getenv('AWS_ACCESS_KEY_ID') or not os.getenv('AWS_SECRET_ACCESS_KEY'):
         raise RuntimeError('R2 credentials missing from Runpod test endpoint secrets')
 

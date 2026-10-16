@@ -74,13 +74,19 @@ class Registry:
         import boto3
         from botocore.config import Config
         endpoint = os.getenv('AIVYLA_R2_ENDPOINT', '')
-        if not (endpoint.startswith('https://') and endpoint.endswith('.r2.cloudflarestorage.com')):
-            raise ValueError('AIVYLA_R2_ENDPOINT must be a Cloudflare R2 S3 endpoint')
+        endpoint = endpoint.rstrip('/')
+        is_tigris = endpoint == 'https://t3.storage.dev'
+        is_r2 = endpoint.startswith('https://') and endpoint.endswith('.r2.cloudflarestorage.com')
+        if not (is_r2 or is_tigris):
+            raise ValueError('AIVYLA_R2_ENDPOINT must be a Cloudflare R2 or Tigris S3 endpoint')
         # Credentials come ONLY from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (secrets).
+        # Tigris uses virtual-hosted S3 addressing; R2 retains its original behavior.
+        settings = {'signature_version': 's3v4', 'max_pool_connections': 24,
+                    'retries': {'max_attempts': 3}}
+        if is_tigris:
+            settings['s3'] = {'addressing_style': 'virtual'}
         return boto3.client('s3', endpoint_url=endpoint, region_name='auto',
-                            config=Config(signature_version='s3v4',
-                                          max_pool_connections=24,
-                                          retries={'max_attempts': 3}))
+                            config=Config(**settings))
 
     def refresh(self, force=False):
         with self._lock:
