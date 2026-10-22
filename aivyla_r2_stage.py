@@ -71,16 +71,50 @@ def _atomic_manifest(dst, fp, digest):
 
 
 def _receipt_sha(client, bucket, key, expected_bytes, etag):
-    """Verify historical R2 uploader receipts when present; direct uploads are also allowed."""
+    """Read and verify an optional trusted receipt; retry transient S3 stream failures."""
+    from botocore.exceptions import (
+        ConnectionClosedError, EndpointConnectionError, ReadTimeoutError,
+        ResponseStreamingError,
+    )
+
     receipt_key = '_aivyla/receipts/' + key + '.json'
-    try:
-        raw = client.get_object(Bucket=bucket, Key=receipt_key)['Body'].read(8192)
-    except Exception as e:
-        # Only missing receipt may be ignored; never suppress network/auth errors.
-        code = getattr(e, 'response', {}).get('Error', {}).get('Code')
-        if isinstance(e, client.exceptions.NoSuchKey) or code in ('NoSuchKey', '404', 'NotFound'):
-            return None
-        raise
+    raw = None
+    for attempt in range(1, 5):
+        body = None
+        try:
+            response = client.get_object(Bucket=bucket, Key=receipt_key)
+            body = response['Body']
+            raw = body.read(8193)
+            length = response.get('ContentLength')
+            if len(raw) > 8192:
+                raise R2IntegrityError(f'Oversized receipt: {receipt_key}')
+            if isinstance(length, int) and len(raw) != length:
+                raise ConnectionClosedError(
+                    endpoint_url='S3 receipt read',
+                    error=f'Short receipt: {len(raw)} of {length} bytes',
+                )
+            break
+        except Exception as exc:
+            # Botocore streaming exceptions may have response=None, unlike ClientError.
+            details = getattr(exc, 'response', None)
+            error = details.get('Error', {}) if isinstance(details, dict) else {}
+            code = error.get('Code') if isinstance(error, dict) else None
+            if isinstance(exc, client.exceptions.NoSuchKey) or code in ('NoSuchKey', '404', 'NotFound'):
+                return None
+            if not isinstance(exc, (ResponseStreamingError, ConnectionClosedError,
+                                    ReadTimeoutError, EndpointConnectionError)):
+                raise
+            print(f'Aivyla receipt read retry {attempt}/4: bucket={bucket} key={receipt_key} '
+                  f'error={type(exc).__name__}', flush=True)
+            if attempt == 4:
+                raise OSError(f'Aivyla receipt unreadable after 4 attempts: '
+                              f'bucket={bucket} key={receipt_key}; '
+                              f'{type(exc).__name__}: {exc}') from exc
+            time.sleep(0.5 * attempt)
+        finally:
+            if body is not None:
+                body.close()
+
     data = json.loads(raw)
     if data.get('bytes') != expected_bytes:
         raise ValueError(f'Remote receipt size mismatch: {key}')
