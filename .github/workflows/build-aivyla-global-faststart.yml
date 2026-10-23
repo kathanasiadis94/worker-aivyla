@@ -95,4 +95,4 @@ jobs:
 # Trigger isolated Aivyla CDN build
 # Trigger Universal CDN v2 isolated build bugs
 # Trigger live preview v4
-# Trigger environment-tunable isolated Tigris image (one build)
+# Trigger environment-tunable isolated Tigris image (one build) v2
