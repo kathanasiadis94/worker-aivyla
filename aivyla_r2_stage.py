@@ -70,19 +70,62 @@ def _atomic_manifest(dst, fp, digest):
     os.replace(temp, receipt)
 
 
+def _local_trusted_receipt(bucket, key, expected_bytes):
+    """SHA256 pinned into this worker image. No remote receipt GET for pinned keys.
+
+    Strictly match the bucket and object size; a changed model is still fully
+    downloaded and hashed against the pinned SHA256. No silent downgrade.
+    """
+    path = Path(os.getenv('AIVYLA_TRUSTED_RECEIPTS_PATH',
+                       '/opt/aivyla-global/aivyla_trusted_receipts.json'))
+    if not path.is_file():
+        return None  # existing per-object receipt mechanism remains in use
+    try:
+        raw = path.read_bytes()
+        doc = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise R2IntegrityError(f'Invalid local trusted receipts manifest: {path}') from exc
+    if not isinstance(doc, dict) or doc.get('schema') != 1 or doc.get('bucket') != bucket:
+        raise R2IntegrityError(f'Local receipts manifest bucket/schema mismatch: {path}, bucket={bucket}')
+    models = doc.get('models')
+    if not isinstance(models, dict):
+        raise R2IntegrityError(f'Invalid local trusted receipts mapping: {path}')
+    item = models.get(key)
+    if item is None:
+        return None  # newly uploaded models still use remote signed receipts
+    if not isinstance(item, dict) or type(item.get('bytes')) is not int or item['bytes'] != expected_bytes:
+        raise R2IntegrityError(f'Pinned receipt model size mismatch: bucket={bucket}, key={key}')
+    digest = item.get('sha256')
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise R2IntegrityError(f'Invalid pinned receipt SHA256: bucket={bucket}, key={key}')
+    return digest
+
+
 def _receipt_sha(client, bucket, key, expected_bytes, etag):
-    """Read and verify an optional trusted receipt; retry transient S3 stream failures."""
+    """Verify a pinned or remotely fetched trusted SHA256, never silently downgrade."""
+    import io
+    from boto3.s3.transfer import TransferConfig
     from botocore.exceptions import (
         ConnectionClosedError, EndpointConnectionError, ReadTimeoutError,
         ResponseStreamingError,
     )
 
+    pinned = _local_trusted_receipt(bucket, key, expected_bytes)
+    if pinned is not None:
+        return pinned
+
     receipt_key = '_aivyla/receipts/' + key + '.json'
+    transient = (ResponseStreamingError, ConnectionClosedError,
+                 ReadTimeoutError, EndpointConnectionError)
     raw = None
+
+    # First use the ordinary S3 GET, then a ranged GET for a different read
+    # route. These attempts are deliberately independent of model concurrency.
     for attempt in range(1, 5):
         body = None
         try:
-            response = client.get_object(Bucket=bucket, Key=receipt_key)
+            extra = {'Range': 'bytes=0-8192'} if attempt >= 3 else {}
+            response = client.get_object(Bucket=bucket, Key=receipt_key, **extra)
             body = response['Body']
             raw = body.read(8193)
             length = response.get('ContentLength')
@@ -93,33 +136,65 @@ def _receipt_sha(client, bucket, key, expected_bytes, etag):
                     endpoint_url='S3 receipt read',
                     error=f'Short receipt: {len(raw)} of {length} bytes',
                 )
+            if not raw:
+                raise R2IntegrityError(f'Empty receipt: {receipt_key}')
             break
         except Exception as exc:
-            # Botocore streaming exceptions may have response=None, unlike ClientError.
             details = getattr(exc, 'response', None)
             error = details.get('Error', {}) if isinstance(details, dict) else {}
             code = error.get('Code') if isinstance(error, dict) else None
             if isinstance(exc, client.exceptions.NoSuchKey) or code in ('NoSuchKey', '404', 'NotFound'):
                 return None
-            if not isinstance(exc, (ResponseStreamingError, ConnectionClosedError,
-                                    ReadTimeoutError, EndpointConnectionError)):
+            if not isinstance(exc, transient):
                 raise
-            print(f'Aivyla receipt read retry {attempt}/4: bucket={bucket} key={receipt_key} '
+            print(f'Aivyla receipt read retry {attempt}/4: key={receipt_key} '
+                  f'path={"range" if attempt >= 3 else "get"} '
                   f'error={type(exc).__name__}', flush=True)
-            if attempt == 4:
-                raise OSError(f'Aivyla receipt unreadable after 4 attempts: '
-                              f'bucket={bucket} key={receipt_key}; '
-                              f'{type(exc).__name__}: {exc}') from exc
-            time.sleep(0.5 * attempt)
+            if attempt < 4:
+                time.sleep(0.5 * attempt)
         finally:
             if body is not None:
                 body.close()
+    else:
+        # Boto3's managed transfer adds separate response-stream retries.
+        # Never load more than 8 KiB of receipt data into RAM.
+        class _LimitedBuffer(io.BytesIO):
+            def write(self, data):
+                if self.tell() + len(data) > 8192:
+                    raise R2IntegrityError(f'Oversized receipt: {receipt_key}')
+                return super().write(data)
+
+        sink = _LimitedBuffer()
+        try:
+            client.download_fileobj(
+                bucket, receipt_key, sink,
+                Config=TransferConfig(
+                    multipart_threshold=8 * 1024**2,
+                    multipart_chunksize=8 * 1024**2,
+                    max_concurrency=1,
+                    num_download_attempts=10,
+                    use_threads=False,
+                ),
+            )
+            raw = sink.getvalue()
+            if not raw:
+                raise R2IntegrityError(f'Empty receipt: {receipt_key}')
+            print(f'Aivyla receipt recovered through managed transfer: '
+                  f'key={receipt_key}', flush=True)
+        except R2IntegrityError:
+            raise
+        except Exception as exc:
+            raise OSError(
+                f'Aivyla receipt unreadable via plain GET, ranged GET and '
+                f'managed S3 transfer: bucket={bucket} key={receipt_key}; '
+                f'{type(exc).__name__}: {exc}'
+            ) from exc
+        finally:
+            sink.close()
 
     data = json.loads(raw)
-    if data.get('bytes') != expected_bytes:
+    if not isinstance(data, dict) or data.get('bytes') != expected_bytes:
         raise ValueError(f'Remote receipt size mismatch: {key}')
-    # Cross-provider copy preserves trusted SHA256 receipt but may change
-    # S3 multipart ETags; the full download is still hashed and verified.
     is_tigris = os.getenv('AIVYLA_R2_ENDPOINT', '').rstrip('/') == 'https://t3.storage.dev'
     if data.get('etag') != etag and not is_tigris:
         raise ValueError(f'Remote receipt ETag mismatch: {key}')
