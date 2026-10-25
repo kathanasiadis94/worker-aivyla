@@ -121,7 +121,10 @@ def main() -> None:
     if baked:
         print('Aivyla FASTBOOT: using SHA256-pinned baked node bundle', flush=True)
     elif v3.LOCAL_ENABLED:
-        subprocess.run([sys.executable, '-u', '/opt/aivyla-global/aivyla_global_nodes.py'], check=True)
+        node_script = ('/opt/aivyla-global/aivyla_fast_node_staging.py'
+                       if os.getenv('AIVYLA_FAST_NODE_STREAM', '0') == '1'
+                       else '/opt/aivyla-global/aivyla_global_nodes.py')
+        subprocess.run([sys.executable, '-u', node_script], check=True)
     phase('node_staging', started)
 
     started = time.monotonic()
