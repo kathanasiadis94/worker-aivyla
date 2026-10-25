@@ -1,0 +1,32 @@
+diff --git a/storage/s3.go b/storage/s3.go
+index 3313be6..b4698d2 100644
+--- a/storage/s3.go
++++ b/storage/s3.go
+@@ -612,6 +612,17 @@ func (s *S3) Get(
+ 		return 0, nil
+ 	}
+ 
++	// Optional bounded write buffer per active download part. Keep the upstream
++	// behavior unless explicitly enabled; this does not change HTTP part sizes.
++	bufferMiB := 0
++	if raw := os.Getenv("S5CMD_DOWNLOAD_BUFFER_MIB"); raw != "" {
++		value, err := strconv.Atoi(raw)
++		if err != nil || value < 0 || value > 16 {
++			return 0, fmt.Errorf("S5CMD_DOWNLOAD_BUFFER_MIB must be between 0 and 16")
++		}
++		bufferMiB = value
++	}
++
+ 	input := &s3.GetObjectInput{
+ 		Bucket:       aws.String(from.Bucket),
+ 		Key:          aws.String(from.Path),
+@@ -624,6 +635,9 @@ func (s *S3) Get(
+ 	return s.downloader.DownloadWithContext(ctx, to, input, func(u *s3manager.Downloader) {
+ 		u.PartSize = partSize
+ 		u.Concurrency = concurrency
++		if bufferMiB > 0 {
++			u.BufferProvider = s3manager.NewPooledBufferedWriterReadFromProvider(bufferMiB * 1024 * 1024)
++		}
+ 	})
+ }
+ 
