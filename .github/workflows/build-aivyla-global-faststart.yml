@@ -44,11 +44,11 @@ jobs:
           dockerfile = Path('Dockerfile.global-r2-fast').read_text()
           assert 'FROM ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v3' in dockerfile
           assert 'CMD ["python", "/opt/aivyla-global/aivyla_fast_start.py"]' in dockerfile
-          for name in ('aivyla_fast_start.py','aivyla_fast_requirements.py','aivyla_global_r2_start.py','aivyla_r2_stage.py'):
+          for name in ('aivyla_fast_start.py','aivyla_fast_node_staging.py','aivyla_fast_requirements.py','aivyla_global_r2_start.py','aivyla_r2_stage.py','test_fast_node_staging.py'):
               assert Path(name).is_file(), name
           print('PASS: isolated FastStart source and Dockerfile')
           PYVERIFY
-          python -m py_compile aivyla_fast_start.py aivyla_fast_requirements.py aivyla_global_r2_start.py aivyla_r2_stage.py
+          python -m py_compile aivyla_fast_start.py aivyla_fast_node_staging.py aivyla_fast_requirements.py aivyla_global_r2_start.py aivyla_r2_stage.py
 
       - name: Install CI S3 dependencies
         shell: bash
@@ -57,11 +57,12 @@ jobs:
           python -m pip install 'boto3>=1.34,<2'
           python -c 'import boto3, botocore; print("PASS: boto3 + botocore available for R2 regression tests")'
 
-      - name: Run all three CPU regression suites
+      - name: Run four CPU regression suites
         shell: bash
         run: |
           set -euo pipefail
           python test_fast_start.py
+          python test_fast_node_staging.py
           python test_global_r2.py
           python test_global_v3.py
 
