@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -248,7 +249,7 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
                 temp.unlink(missing_ok=True)
                 print(f'Aivyla CDN unavailable ({type(exc).__name__}); using direct R2', flush=True)
         if transport == 'direct_r2':
-            registry().client.download_file(registry().bucket, model.key, str(temp), Config=config)
+            transport = _direct_download(model, temp, config)
         transfer_s = time.monotonic() - started
         if temp.stat().st_size != model.bytes:
             raise R2IntegrityError(f'R2 download incomplete: {model.key}')
@@ -286,6 +287,47 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
             raise
         print(f'Aivyla R2 network failure, trying Global Volume for {model.filename}: {type(exc).__name__}', flush=True)
         return _copy_volume(source[1], dst)
+
+
+def _direct_download(model, temp, config):
+    """Select the transfer engine; all callers retain the same integrity checks."""
+    engine = os.getenv('AIVYLA_R2_DOWNLOAD_ENGINE', 'boto3').strip().lower()
+    if engine not in ('boto3', 's5cmd'):
+        raise ValueError('AIVYLA_R2_DOWNLOAD_ENGINE must be boto3 or s5cmd')
+    if engine == 's5cmd':
+        endpoint = os.getenv('AIVYLA_R2_ENDPOINT', '').rstrip('/')
+        if endpoint != 'https://t3.storage.dev':
+            raise ValueError('s5cmd engine currently supports the Tigris endpoint only')
+        streams = env_int('AIVYLA_S5CMD_CONCURRENCY', 32, 1, 64)
+        chunk = env_int('AIVYLA_S5CMD_PART_SIZE_MIB', 64, 8, 128)
+        timeout = env_int('AIVYLA_S5CMD_TIMEOUT_SECONDS', 1800, 30, 7200)
+        binary = os.getenv('AIVYLA_S5CMD_PATH', 's5cmd')
+        # argv, never a shell. --raw prevents literal object keys from expanding
+        # as wildcard expressions. Each process downloads exactly one model.
+        command = [binary, '--endpoint-url', endpoint, '--numworkers', '1',
+                   'cp', '--raw', '--concurrency', str(streams),
+                   '--part-size', str(chunk),
+                   f's3://{registry().bucket}/{model.key}', str(temp)]
+        env = dict(os.environ, AWS_REGION='auto', AWS_DEFAULT_REGION='auto')
+        try:
+            # Do not log subprocess output (it can contain credential details).
+            # Scratch directory also collects SDK temporary files on timeouts.
+            with tempfile.TemporaryDirectory(prefix='.aivyla-s5-', dir=temp.parent) as work:
+                local = Path(work)/'model.part'
+                command[-1] = str(local)
+                subprocess.run(command, env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=True, timeout=timeout)
+                if not local.is_file() or local.stat().st_size != model.bytes:
+                    raise R2IntegrityError(f's5cmd download incomplete: {model.key}')
+                os.replace(local, temp)
+            print(f'Aivyla s5cmd transfer: streams={streams} chunk_mib={chunk}', flush=True)
+            return 's5cmd'
+        except (OSError, subprocess.SubprocessError) as exc:
+            temp.unlink(missing_ok=True)
+            print(f'Aivyla s5cmd unavailable ({type(exc).__name__}); '
+                  'using verified boto3 transfer', flush=True)
+    registry().client.download_file(registry().bucket, model.key, str(temp), Config=config)
+    return 'direct_r2'
 
 
 def _copy_volume(src, dst):

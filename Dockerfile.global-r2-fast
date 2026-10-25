@@ -1,6 +1,9 @@
 # Isolated Aivyla Global FastStart test image; production unaffected.
 FROM ghcr.io/kathanasiadis94/worker-aivyla:aivyla-global-v3
 
+COPY scripts/install-s5cmd.py /tmp/install-s5cmd.py
+RUN python /tmp/install-s5cmd.py && rm /tmp/install-s5cmd.py
+
 RUN python -m pip install --no-cache-dir 'boto3>=1.34,<2' \
  && python -m pip check
 
