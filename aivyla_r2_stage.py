@@ -254,7 +254,11 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
         if temp.stat().st_size != model.bytes:
             raise R2IntegrityError(f'R2 download incomplete: {model.key}')
         hash_started = time.monotonic()
-        digest = _hash(temp)
+        # AIVYLA_R2_VERIFY_SHA256=0 skips the full-file hash when a trusted receipt
+        # exists. Integrity then rests on exact size, safetensors structure and an
+        # unchanged source object (HEAD below). Default (1) keeps the full hash.
+        skip_hash = bool(expected_sha) and os.getenv('AIVYLA_R2_VERIFY_SHA256', '1') == '0'
+        digest = expected_sha if skip_hash else _hash(temp)
         hash_s = time.monotonic() - hash_started
         if expected_sha and digest != expected_sha:
             raise R2IntegrityError(f'R2 SHA256 mismatch: {model.key}')
@@ -272,7 +276,7 @@ def _fetch_one(model, dst, filename, categories, allow_fallback=True):
               f'{model.bytes/1024**3:.2f} GiB; receipt={receipt_s:.2f}s '
               f'download={transfer_s:.2f}s sha256={hash_s:.2f}s '
               f'verify={verify_s:.2f}s total={time.monotonic()-start_total:.2f}s '
-              f'checksum={"trusted_sha256_pass" if expected_sha else "local_sha256_only"} '
+              f'checksum={"size_etag_only" if skip_hash else ("trusted_sha256_pass" if expected_sha else "local_sha256_only")} '
               f'workers={concurrency} transport={transport}', flush=True)
         return 'r2'
     except Exception as exc:
