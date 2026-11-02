@@ -6,6 +6,7 @@ Requires a new worker/restart for ComfyUI to discover new Python node classes.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import subprocess
 import tarfile
 import tempfile
 
-from aivyla_r2_registry import Registry
+from aivyla_r2_registry import Registry, env_int
 
 LOCAL_NODES = Path(os.getenv('AIVYLA_GLOBAL_NODE_ROOT', '/tmp/aivyla-node-cache'))
 COMFY_NODES = Path('/comfyui/custom_nodes')
@@ -83,6 +84,49 @@ def _install_requirements(node_dir):
                         '--no-cache-dir', '-r', str(req)], check=True, timeout=300)
 
 
+def _prepare_node(registry, local, comfy, existing, node):
+    """Download, verify and unpack one node into the local cache; return its path.
+
+    Safe to run concurrently for different nodes: it touches only its own temp
+    directory and local/<name>. pip and the ComfyUI symlink stay serialized.
+    """
+    name, key, expected = node['name'], node['key'], node['sha256']
+    if name in existing or (comfy/name).exists() or (comfy/name).is_symlink():
+        raise FileExistsError(f'R2 node collides with existing ComfyUI node: {name}')
+    head = registry.client.head_object(Bucket=registry.bucket, Key=key)
+    if head['ContentLength'] > MAX_ARCHIVE_GIB*1024**3 or head['ContentLength'] <= 0:
+        raise ValueError(f'R2 node archive size invalid: {name}')
+    with tempfile.TemporaryDirectory(prefix='aivyla-r2-node-', dir='/tmp') as work:
+        src = Path(work)/'bundle.tar.gz'
+        extract = Path(work)/'extract'
+        extract.mkdir()
+        registry.client.download_file(registry.bucket, key, str(src))
+        if _hash(src) != expected:
+            raise ValueError(f'Custom node SHA256 mismatch: {name}')
+        _inspect(src, name)
+        # tarfile.extractall(filter='data') requires a newer Python.
+        # Extract only previously validated regular files and directories;
+        # never restore links, special files, owners or unsafe permissions.
+        with tarfile.open(src, 'r:gz') as tf:
+            for member in tf.getmembers():
+                dest = extract.joinpath(*Path(member.name).parts)
+                if member.isdir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    reader = tf.extractfile(member)
+                    if reader is None:
+                        raise ValueError('Unable to read node archive member')
+                    with reader, dest.open('xb') as writer:
+                        shutil.copyfileobj(reader, writer, length=1024*1024)
+                    dest.chmod(0o755 if member.mode & 0o111 else 0o644)
+        target = local/name
+        if target.exists():
+            raise FileExistsError(f'Node target unexpectedly exists: {name}')
+        shutil.move(str(extract/name), str(target))
+    return target
+
+
 def install_enabled_nodes(registry=None, *, local=None, comfy=None):
     registry = registry or Registry()
     local = Path(local) if local is not None else LOCAL_NODES
@@ -94,46 +138,26 @@ def install_enabled_nodes(registry=None, *, local=None, comfy=None):
     all_nodes = registry.nodes()
     existing = set(x.name for x in local.iterdir() if x.is_dir())
     enabled = [x for x in all_nodes if x['enabled']]
+    names = [x['name'] for x in enabled]
+    if len(set(names)) != len(names):
+        raise ValueError('Duplicate enabled R2 node names')
+    # AIVYLA_R2_NODE_PARALLEL=1 restores the previous fully sequential behavior.
+    workers = max(1, min(env_int('AIVYLA_R2_NODE_PARALLEL', 6, 1, 16), len(enabled)))
     installed = []
-    for node in enabled:
-        name, key, expected = node['name'], node['key'], node['sha256']
-        if name in existing or (comfy/name).exists() or (comfy/name).is_symlink():
-            raise FileExistsError(f'R2 node collides with existing ComfyUI node: {name}')
-        head = registry.client.head_object(Bucket=registry.bucket, Key=key)
-        if head['ContentLength'] > MAX_ARCHIVE_GIB*1024**3 or head['ContentLength'] <= 0:
-            raise ValueError(f'R2 node archive size invalid: {name}')
-        with tempfile.TemporaryDirectory(prefix='aivyla-r2-node-', dir='/tmp') as work:
-            src = Path(work)/'bundle.tar.gz'
-            extract = Path(work)/'extract'
-            extract.mkdir()
-            registry.client.download_file(registry.bucket, key, str(src))
-            if _hash(src) != expected:
-                raise ValueError(f'Custom node SHA256 mismatch: {name}')
-            _inspect(src, name)
-            # tarfile.extractall(filter='data') requires a newer Python.
-            # Extract only previously validated regular files and directories;
-            # never restore links, special files, owners or unsafe permissions.
-            with tarfile.open(src, 'r:gz') as tf:
-                for member in tf.getmembers():
-                    dest = extract.joinpath(*Path(member.name).parts)
-                    if member.isdir():
-                        dest.mkdir(parents=True, exist_ok=True)
-                    else:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        reader = tf.extractfile(member)
-                        if reader is None:
-                            raise ValueError('Unable to read node archive member')
-                        with reader, dest.open('xb') as writer:
-                            shutil.copyfileobj(reader, writer, length=1024*1024)
-                        dest.chmod(0o755 if member.mode & 0o111 else 0o644)
-            target = local/name
-            if target.exists():
-                raise FileExistsError(f'Node target unexpectedly exists: {name}')
-            shutil.move(str(extract/name), str(target))
-        _install_requirements(target)
-        (comfy/name).symlink_to(target, target_is_directory=True)
-        installed.append(name)
-        print(f'Aivyla R2 node installed: {name} ({node["version"]}) SHA256 PASS', flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        # map() yields in registry order, so pip, symlinks and log lines keep the
+        # original order while later nodes are still downloading.
+        try:
+            for node, target in zip(enabled, pool.map(
+                    lambda n: _prepare_node(registry, local, comfy, existing, n), enabled)):
+                name = node['name']
+                _install_requirements(target)
+                (comfy/name).symlink_to(target, target_is_directory=True)
+                installed.append(name)
+                print(f'Aivyla R2 node installed: {name} ({node["version"]}) SHA256 PASS', flush=True)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
     print(f'Aivyla R2 nodes: enabled={len(enabled)}, staged={len(installed)}, '
           f'catalog={len(all_nodes)}', flush=True)
     return {'listed':len(all_nodes), 'enabled':len(enabled), 'installed':installed}
