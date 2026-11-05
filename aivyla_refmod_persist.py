@@ -11,7 +11,11 @@ import re
 from pathlib import Path
 
 EXTRACT_CLASS = 'MiniMaxH3RefModExtract'
-SKIP_VALUES = {'', 'none', 'None', 'null', '-', 'disabled'}
+class _Skip(set):
+    def __contains__(self, v):
+        s = str(v).strip().lower()
+        return s in {'', 'none', '(none)', 'null', '-', 'disabled'} or (s.startswith('(') and s.endswith(')'))
+SKIP_VALUES = _Skip()
 LOADER_FIELD = re.compile(r'^mod_(\d+|a_\d+|b_\d+)$')
 DOWNLOAD_DIR = Path(os.getenv('AIVYLA_REFMOD_DOWNLOAD_DIR', '/comfyui/models/refmods'))
 SAFE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$')
