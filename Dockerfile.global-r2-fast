@@ -55,9 +55,9 @@ print('Aivyla trusted SHA256 manifest verified:', len(m['models']), 'models')
 PYVERIFY
 
 # Preserve the Global-only preview-aware handler.
-COPY handler.py aivyla_preview.py aivyla_output_upload.py /
+COPY handler.py aivyla_preview.py aivyla_output_upload.py aivyla_refmod_persist.py /
 
-RUN python -m py_compile /opt/aivyla-global/*.py /handler.py /aivyla_preview.py /aivyla_output_upload.py \
+RUN python -m py_compile /opt/aivyla-global/*.py /handler.py /aivyla_preview.py /aivyla_output_upload.py /aivyla_refmod_persist.py \
  && python -c "import runpy; scope = runpy.run_path('/handler.py', run_name='aivyla_preview_build_check'); assert callable(scope['handler']); assert 'PreviewPublisher' in scope; print('PASS: preview handler import and dependencies')"
 
 ENV AIVYLA_FAST_REQUIREMENTS=1 AIVYLA_FAST_NODE_STREAM=1 \
