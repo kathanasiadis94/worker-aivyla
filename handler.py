@@ -909,7 +909,20 @@ def handler(job):
         return {
             "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries."
         }
-
+    # AIVYLA_REFMOD_PERSIST: restore RefMods used by loaders from storage
+    try:
+        try:
+            from aivyla_refmod_persist import ensure_refmods
+        except ModuleNotFoundError as exc:
+            if exc.name != "aivyla_refmod_persist":
+                raise
+            ensure_refmods = None
+        if ensure_refmods is not None:
+            _restored = ensure_refmods(workflow)
+            if _restored:
+                print(f"worker-comfyui - Restored RefMods: {_restored}")
+    except Exception as exc:
+        return {"error": f"RefMod restore failed: {exc}"}
     # Upload input images if they exist
     if input_images:
         upload_result = upload_images(input_images)
@@ -1225,7 +1238,21 @@ def handler(job):
         )
         final_result["status"] = "success_no_images"
         final_result["images"] = []
-
+    # AIVYLA_REFMOD_PERSIST: save RefMods created by this job
+    try:
+        try:
+            from aivyla_refmod_persist import persist_refmods
+        except ModuleNotFoundError as exc:
+            if exc.name != "aivyla_refmod_persist":
+                raise
+            persist_refmods = None
+        if persist_refmods is not None:
+            _saved = persist_refmods(workflow)
+            if _saved:
+                final_result["refmods_saved"] = _saved
+    except Exception as exc:
+        traceback.print_exc()
+        return {"error": f"RefMod was created but could not be saved to storage: {exc}"}
     print(f"worker-comfyui - Job completed. Returning {len(output_data)} image(s).")
     return final_result
 
